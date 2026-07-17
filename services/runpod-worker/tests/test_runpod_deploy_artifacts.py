@@ -1,14 +1,44 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parents[3]
 DEPLOY_ROOT = REPO_ROOT / "deploy" / "runpod"
+WORKER_ROOT = REPO_ROOT / "services" / "runpod-worker"
 
 
 def load_json(name: str):
     return json.loads((DEPLOY_ROOT / name).read_text(encoding="utf-8"))
+
+
+def test_batch_upload_dependency_does_not_leak_into_diarizer_runtime():
+    project = tomllib.loads(
+        (WORKER_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    base_dependencies = project["dependencies"]
+    optional_dependencies = project["optional-dependencies"]
+
+    assert not any(item.startswith("python-multipart") for item in base_dependencies)
+    assert any(
+        item.startswith("python-multipart") for item in optional_dependencies["batch"]
+    )
+    assert any(
+        item.startswith("python-multipart") for item in optional_dependencies["dev"]
+    )
+
+    asr_lock = (WORKER_ROOT / "requirements.asr.lock").read_text(encoding="utf-8")
+    diarizer_lock = (WORKER_ROOT / "requirements.diarizer.lock").read_text(
+        encoding="utf-8"
+    )
+    workflow = (REPO_ROOT / ".github" / "workflows" / "worker-image.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "python-multipart==" in asr_lock
+    assert "python-multipart==" not in diarizer_lock
+    assert "uv export --frozen --extra gpu --extra batch" in workflow
 
 
 def test_model_template_map_includes_single_session_lab_batch_runtime():

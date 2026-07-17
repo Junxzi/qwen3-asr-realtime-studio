@@ -52,7 +52,7 @@ jobs:
 
       - name: Verify generated dependency locks
         run: |
-          uv export --frozen --extra gpu --no-dev --no-emit-project \
+          uv export --frozen --extra gpu --extra batch --no-dev --no-emit-project \
             --output-file requirements.asr.lock
           git diff --exit-code -- requirements.asr.lock
           uv pip compile requirements.diarizer.in \
