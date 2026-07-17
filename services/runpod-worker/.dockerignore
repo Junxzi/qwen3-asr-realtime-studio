@@ -1,0 +1,12 @@
+**
+!pyproject.toml
+!uv.lock
+!requirements.asr.lock
+!requirements.diarizer.lock
+!README.md
+!src/
+!src/**
+!config/
+!config/models.lock.json
+!scripts/
+!scripts/**

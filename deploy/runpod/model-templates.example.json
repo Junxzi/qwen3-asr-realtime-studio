@@ -1,0 +1,8 @@
+[
+  {
+    "model_id": "infodeliverailab/qwen3-asr-ja-rlbr-context-fullft",
+    "runtime": "realtime",
+    "template_id": "replace-with-context-worker-template-id",
+    "max_sessions": 32
+  }
+]

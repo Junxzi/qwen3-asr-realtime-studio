@@ -1,0 +1,17 @@
+{
+  "infodeliverailab/qwen3-asr-ja-rlbr-context-fullft": {
+    "revision": "f03e7f67651f99e3b03e58a52567d744e32d3b92",
+    "local_dir": "/workspace/models/qwen3-asr-ja-rlbr-context-fullft",
+    "requires_context_catalog": true
+  },
+  "Qwen/Qwen3-ForcedAligner-0.6B": {
+    "revision": "c7cbfc2048c462b0d63a45797104fc9db3ad62b7",
+    "local_dir": "/workspace/models/Qwen3-ForcedAligner-0.6B",
+    "requires_context_catalog": false
+  },
+  "nvidia/diar_streaming_sortformer_4spk-v2.1": {
+    "revision": "fafaab5faa1617a0ca52d38dd3dc4bd636800d3d",
+    "local_dir": "/workspace/models/diar_streaming_sortformer_4spk-v2.1-verified",
+    "requires_context_catalog": false
+  }
+}
