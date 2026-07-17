@@ -13,6 +13,8 @@ export interface AsrModelDescriptor {
   recommended: boolean;
   estimated_vram_gb: number;
   source: "private_model" | "public_recipe";
+  integration_status: "ready" | "gpu_validation_required" | "adapter_required";
+  selectable: boolean;
 }
 
 export const DEFAULT_ASR_MODEL_ID = "infodeliverailab/qwen3-asr-ja-rlbr-context-fullft";
@@ -30,6 +32,53 @@ const ASR_MODELS: readonly AsrModelDescriptor[] = [
     recommended: true,
     estimated_vram_gb: 32,
     source: "private_model",
+    integration_status: "ready",
+    selectable: true,
+  },
+  {
+    id: "infodeliverailab/lab_asr_jp_1",
+    display_name: "Lab ASR JP 1",
+    short_name: "Lab JP 1",
+    description: "日本語2話者電話向けのspeaker token統合Qwen3-ASR checkpoint",
+    runtime: "batch",
+    input_modes: ["file"],
+    supports_context: false,
+    supports_diarization: true,
+    recommended: false,
+    estimated_vram_gb: 32,
+    source: "private_model",
+    integration_status: "gpu_validation_required",
+    selectable: false,
+  },
+  {
+    id: "infodeliverailab/lab_asr_diarization_v1",
+    display_name: "Lab ASR Diarization v1",
+    short_name: "Diarization v1",
+    description: "ECAPA話者特徴をtemporal interleaveするオフライン比較モデル",
+    runtime: "batch",
+    input_modes: ["file"],
+    supports_context: false,
+    supports_diarization: true,
+    recommended: false,
+    estimated_vram_gb: 32,
+    source: "private_model",
+    integration_status: "adapter_required",
+    selectable: false,
+  },
+  {
+    id: "infodeliverailab/lab_asr_diarization_v2",
+    display_name: "Lab ASR Diarization v2",
+    short_name: "Diarization v2",
+    description: "YT増強版のECAPA temporal-interleaveオフラインモデル",
+    runtime: "batch",
+    input_modes: ["file"],
+    supports_context: false,
+    supports_diarization: true,
+    recommended: false,
+    estimated_vram_gb: 32,
+    source: "private_model",
+    integration_status: "adapter_required",
+    selectable: false,
   },
   {
     id: "infodeliverailab/qwen3-omni-jp-vllm",
@@ -43,6 +92,8 @@ const ASR_MODELS: readonly AsrModelDescriptor[] = [
     recommended: false,
     estimated_vram_gb: 70,
     source: "public_recipe",
+    integration_status: "adapter_required",
+    selectable: false,
   },
 ] as const;
 
@@ -51,5 +102,5 @@ export function listAsrModels() {
 }
 
 export function isSupportedAsrModel(modelId: string) {
-  return ASR_MODELS.some((model) => model.id === modelId);
+  return ASR_MODELS.some((model) => model.id === modelId && model.selectable);
 }

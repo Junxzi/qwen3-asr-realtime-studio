@@ -13,17 +13,20 @@ import { ProviderError } from "./runpod.js";
 import { registerTranscriptionRoutes } from "./transcription-routes.js";
 import { StoreError, type TranscriptionStore } from "./transcriptions.js";
 import type { OperationState, PodProvider } from "./types.js";
+import { registerWorkerRoutes } from "./worker-routes.js";
+import { createWorkerScheduler, type WorkerScheduler } from "./worker-scheduler.js";
 
 const loginSchema = z.object({ password: z.string().min(1).max(256) });
 
 export function createApp(
   config: AppConfig,
   provider: PodProvider,
-  options: { serveStatic?: boolean; now?: () => number; store?: TranscriptionStore } = {},
+  options: { serveStatic?: boolean; now?: () => number; store?: TranscriptionStore; scheduler?: WorkerScheduler } = {},
 ) {
   const app = express();
   const now = options.now ?? Date.now;
   const store = options.store ?? createTranscriptionStore(config);
+  const scheduler = options.scheduler ?? createWorkerScheduler(config, provider, { now });
   let operation: OperationState | null = null;
 
   app.disable("x-powered-by");
@@ -40,12 +43,14 @@ export function createApp(
   app.use(cookieParser());
 
   app.get("/api/health", async (_request, response) => {
-    const storage = await store.health();
-    response.status(storage.ready ? 200 : 503).json({
-      status: storage.ready ? "healthy" : "degraded",
+    const [storage, workerPool] = await Promise.all([store.health(), scheduler.health()]);
+    const ready = storage.ready && workerPool.ready;
+    response.status(ready ? 200 : 503).json({
+      status: ready ? "healthy" : "degraded",
       service: "qwen-railway-control",
       provider: config.provider,
-      storage: { kind: store.kind, ...storage },
+      storage: { kind: store.kind, ready: storage.ready },
+      worker_pool: { ready: workerPool.ready },
       timestamp: new Date(now()).toISOString(),
     });
   });
@@ -80,10 +85,40 @@ export function createApp(
       },
     });
   });
-  registerTranscriptionRoutes(app, config, store, authenticated, requireAllowedOrigin(config), now);
+  registerTranscriptionRoutes(app, config, store, authenticated, requireAllowedOrigin(config), now, scheduler);
+  registerWorkerRoutes(app, store, scheduler, authenticated, requireAllowedOrigin(config), now);
 
   app.get("/api/control/status", authenticated, async (_request, response, next) => {
     try {
+      const pool = await scheduler.diagnostics();
+      if (!config.legacyWorkerMode) {
+        const selected = pool.workers.find((worker) => worker.status === "ready") || pool.workers[0];
+        const stage = pool.summary.ready > 0
+          ? "ready"
+          : pool.workers.some((worker) => worker.status === "starting" || worker.status === "loading")
+            ? "starting"
+            : pool.workers.every((worker) => worker.status === "stopped") ? "stopped" : "error";
+        response.json({
+          data: {
+            stage,
+            control: { mode: config.provider, available: config.provider !== "readonly" },
+            pod: selected ? {
+              id: selected.pod_id,
+              name: selected.name,
+              desiredStatus: selected.status === "stopped" ? "EXITED" : selected.status === "terminated" ? "TERMINATED" : "RUNNING",
+              gpu: selected.gpu,
+            } : null,
+            service: selected ? {
+              ready: selected.status === "ready",
+              health: selected.health,
+            } : { ready: false },
+            pool,
+            operation: null,
+            checkedAt: new Date(now()).toISOString(),
+          },
+        });
+        return;
+      }
       let stage: "stopped" | "starting" | "ready" | "stopping" | "error";
       let probe = null;
       let pod;
@@ -91,7 +126,7 @@ export function createApp(
         probe = await provider.probeService();
         pod = {
           id: config.podId,
-          name: "qwen3asr-finetuning-migration-migration",
+          name: config.workers[0]?.name ?? "configured Qwen worker",
           desiredStatus: probe.ready ? "RUNNING" as const : "EXITED" as const,
           gpu: { id: "A100-80GB", displayName: "NVIDIA A100 80GB", count: 1 },
         };
@@ -113,7 +148,6 @@ export function createApp(
         }
       }
       const websocketUrl = `${config.serviceUrl.replace(/^http/, "ws")}/v1/realtime`;
-      const batchUrl = `${config.serviceUrl}/v1/transcribe`;
       response.json({
         data: {
           stage,
@@ -122,12 +156,12 @@ export function createApp(
           service: {
             url: config.serviceUrl,
             websocketUrl,
-            batchUrl,
             ready: probe?.ready ?? false,
             health: probe?.health,
             message: probe?.message,
           },
           operation,
+          pool,
           checkedAt: new Date(now()).toISOString(),
         },
       });
@@ -140,6 +174,9 @@ export function createApp(
     try {
       if (config.provider === "readonly") {
         throw new ProviderError("runpod_control_unavailable", "RunPod管理者のAPIキーが必要です。現在は文字起こし接続のみ利用できます", 503);
+      }
+      if (!config.legacyWorkerMode || config.workers.length !== 1) {
+        throw new ProviderError("worker_target_required", "複数GPU構成では割り当てAPIから対象ワーカーを起動してください", 409);
       }
       const pod = await provider.getPod();
       if (pod.desiredStatus !== "RUNNING") await provider.startPod();
@@ -155,8 +192,14 @@ export function createApp(
       if (config.provider === "readonly") {
         throw new ProviderError("runpod_control_unavailable", "RunPod管理者のAPIキーが必要です。現在は文字起こし接続のみ利用できます", 503);
       }
+      if (!config.legacyWorkerMode || config.workers.length !== 1) {
+        throw new ProviderError("worker_target_required", "複数GPU構成では対象ワーカーを指定して停止してください", 409);
+      }
       const pod = await provider.getPod();
-      if (pod.desiredStatus !== "EXITED") await provider.stopPod();
+      if (pod.desiredStatus !== "EXITED") {
+        if (config.provider === "live") await scheduler.stopWorker(config.workers[0].id);
+        else await provider.stopPod();
+      }
       operation = operation?.kind === "stop" ? operation : { id: randomUUID(), kind: "stop", requestedAt: new Date(now()).toISOString() };
       response.status(202).json({ data: { operationId: operation.id, stage: "stopping" } });
     } catch (error) {

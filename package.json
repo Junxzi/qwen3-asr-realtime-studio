@@ -15,6 +15,7 @@
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
     "test:contract": "vitest run tests/contract",
+    "test:postgres": "vitest run --config vitest.postgres.config.ts",
     "check": "npm run lint && npm run typecheck && npm test && npm run build"
   },
   "keywords": [],
@@ -35,6 +36,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cookie-parser": "^1.4.7",
+    "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
     "express": "^5.2.1",
     "lucide-react": "^1.24.0",

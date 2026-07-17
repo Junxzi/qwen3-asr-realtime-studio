@@ -22,6 +22,5 @@
 ## Technology
 
 - Railway: React/Vite静的成果物とExpress制御APIを単一Nodeサービスで配信。
-- RunPod: 既存Pod `nhf73n5jvajgyj`。REST APIでstart/stop/statusを操作。
+- RunPod: `RUNPOD_WORKERS_JSON`へ明示した複数Pod、またはTemplateから作成するdynamic worker。固定Pod IDへ依存しない。
 - Audio: ブラウザからRunPodの`/v1/realtime`へ直接WSS送信し、Railwayを音声中継に使わない。
-

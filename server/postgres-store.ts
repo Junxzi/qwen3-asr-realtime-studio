@@ -7,6 +7,7 @@ import {
   ilike,
   inArray,
   lt,
+  lte,
   or,
   sql,
   type SQL,
@@ -222,6 +223,22 @@ export class PostgresTranscriptionStore implements TranscriptionStore {
     }
   }
 
+  async setCatalogRevision(id: string, catalogRevision: string, now: Date) {
+    try {
+      const [updated] = await this.database.update(transcriptionSessions)
+        .set({ catalogRevision, updatedAt: now })
+        .where(eq(transcriptionSessions.id, id))
+        .returning();
+      if (!updated) return null;
+      const [countRow] = await this.database.select({ value: sql<number>`count(*)::int` })
+        .from(transcriptUtterances)
+        .where(eq(transcriptUtterances.sessionId, id));
+      return mapSession(updated, Number(countRow?.value || 0));
+    } catch (error) {
+      this.fail(error);
+    }
+  }
+
   async upsertUtterance(sessionId: string, input: UpsertUtteranceInput) {
     try {
       return await this.database.transaction(async (transaction) => {
@@ -253,8 +270,17 @@ export class PostgresTranscriptionStore implements TranscriptionStore {
         if (existing) {
           [saved] = await transaction.update(transcriptUtterances)
             .set(values)
-            .where(eq(transcriptUtterances.id, existing.id))
+            .where(and(
+              eq(transcriptUtterances.id, existing.id),
+              lte(transcriptUtterances.revision, input.revision),
+            ))
             .returning();
+          if (!saved) {
+            [saved] = await transaction.select()
+              .from(transcriptUtterances)
+              .where(eq(transcriptUtterances.id, existing.id))
+              .limit(1);
+          }
         } else {
           const [maximum] = await transaction.select({
             value: sql<number>`coalesce(max(${transcriptUtterances.sequence}), 0)::int`,
@@ -295,13 +321,23 @@ export class PostgresTranscriptionStore implements TranscriptionStore {
           metrics: input.metrics,
           updatedAt: input.now,
         })
-        .where(eq(transcriptionSessions.id, id))
+        .where(and(
+          eq(transcriptionSessions.id, id),
+          eq(transcriptionSessions.status, "recording"),
+        ))
         .returning();
-      if (!updated) return null;
+      let session = updated;
+      if (!session) {
+        [session] = await this.database.select()
+          .from(transcriptionSessions)
+          .where(eq(transcriptionSessions.id, id))
+          .limit(1);
+      }
+      if (!session) return null;
       const [countRow] = await this.database.select({ value: sql<number>`count(*)::int` })
         .from(transcriptUtterances)
         .where(eq(transcriptUtterances.sessionId, id));
-      return mapSession(updated, Number(countRow?.value || 0));
+      return mapSession(session, Number(countRow?.value || 0));
     } catch (error) {
       this.fail(error);
     }
@@ -313,6 +349,24 @@ export class PostgresTranscriptionStore implements TranscriptionStore {
         .where(eq(transcriptionSessions.id, id))
         .returning({ id: transcriptionSessions.id });
       return deleted.length > 0;
+    } catch (error) {
+      this.fail(error);
+    }
+  }
+
+  async listMaintenanceCandidates(now: Date, staleMinutes: number) {
+    try {
+      const threshold = new Date(now.getTime() - staleMinutes * 60_000);
+      const rows = await this.database.select({ id: transcriptionSessions.id })
+        .from(transcriptionSessions)
+        .where(or(
+          lt(transcriptionSessions.expiresAt, now),
+          and(
+            eq(transcriptionSessions.status, "recording"),
+            lt(transcriptionSessions.lastActivityAt, threshold),
+          ),
+        ));
+      return rows.map((row) => row.id);
     } catch (error) {
       this.fail(error);
     }

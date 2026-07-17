@@ -8,6 +8,20 @@
       "when": 1784192400000,
       "tag": "0000_transcription_history",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1784220000000,
+      "tag": "0001_worker_pool",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1784250000000,
+      "tag": "0002_unique_worker_pod",
+      "breakpoints": true
     }
   ]
 }

@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   boolean,
   doublePrecision,
@@ -54,4 +55,45 @@ export const transcriptUtterances = pgTable("transcript_utterances", {
 }, (table) => [
   uniqueIndex("transcript_utterances_session_utterance_idx").on(table.sessionId, table.utteranceId),
   uniqueIndex("transcript_utterances_session_sequence_idx").on(table.sessionId, table.sequence),
+]);
+
+export const inferenceWorkers = pgTable("inference_workers", {
+  id: varchar("id", { length: 160 }).primaryKey(),
+  podId: varchar("pod_id", { length: 160 }).notNull().default(""),
+  name: varchar("name", { length: 200 }).notNull(),
+  serviceUrl: text("service_url").notNull(),
+  modelId: varchar("model_id", { length: 240 }).notNull(),
+  runtime: varchar("runtime", { length: 20 }).notNull(),
+  origin: varchar("origin", { length: 20 }).notNull().default("static"),
+  status: varchar("status", { length: 24 }).notNull(),
+  maxSessions: integer("max_sessions").notNull(),
+  activeSessions: integer("active_sessions").notNull().default(0),
+  enabled: boolean("enabled").notNull().default(true),
+  gpu: jsonb("gpu").$type<Record<string, unknown> | null>(),
+  health: jsonb("health").$type<Record<string, unknown> | null>(),
+  lastHeartbeatAt: timestamp("last_heartbeat_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
+}, (table) => [
+  index("inference_workers_scheduler_idx").on(table.enabled, table.status, table.modelId, table.runtime),
+  uniqueIndex("inference_workers_pod_id_unique_idx").on(table.podId).where(sql`${table.podId} <> ''`),
+]);
+
+export const transcriptionAssignments = pgTable("transcription_assignments", {
+  id: uuid("id").primaryKey(),
+  sessionId: uuid("session_id").notNull().references(() => transcriptionSessions.id, { onDelete: "cascade" }),
+  workerId: varchar("worker_id", { length: 160 }).references(() => inferenceWorkers.id, { onDelete: "set null" }),
+  modelId: varchar("model_id", { length: 240 }).notNull(),
+  purpose: varchar("purpose", { length: 20 }).notNull(),
+  status: varchar("status", { length: 24 }).notNull(),
+  message: text("message"),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }).notNull(),
+  activatedAt: timestamp("activated_at", { withTimezone: true }),
+  releasedAt: timestamp("released_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
+}, (table) => [
+  uniqueIndex("transcription_assignments_session_idx").on(table.sessionId),
+  index("transcription_assignments_worker_status_idx").on(table.workerId, table.status),
+  index("transcription_assignments_lease_idx").on(table.leaseExpiresAt),
 ]);

@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../../server/app.js";
 import { loadConfig } from "../../server/config.js";
 import { MockRunPodProvider, ReadonlyRunPodProvider } from "../../server/runpod.js";
+import { createWorkerScheduler } from "../../server/worker-scheduler.js";
+import { MemoryWorkerPoolStore } from "../../server/worker-store.js";
 
 describe("control API", () => {
   let clock: number;
@@ -28,6 +30,36 @@ describe("control API", () => {
     const response = await request(app).get("/api/control/status").expect(401);
     expect(response.body.error.code).toBe("authentication_required");
     expect(response.body.error.requestId).toBe(response.headers["x-request-id"]);
+  });
+
+  it("reports transcription storage and worker registry health", async () => {
+    const response = await request(app).get("/api/health").expect(200);
+    expect(response.body).toMatchObject({
+      status: "healthy",
+      storage: { kind: "memory", ready: true },
+      worker_pool: { ready: true },
+    });
+  });
+
+  it("degrades public health when the worker registry is unavailable", async () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      RUNPOD_PROVIDER: "mock",
+      CONTROL_PASSWORD: "test-password",
+      SESSION_SECRET: "test-session-secret-at-least-32-characters",
+    });
+    const unhealthyWorkerStore = new MemoryWorkerPoolStore();
+    unhealthyWorkerStore.health = async () => ({ ready: false });
+    const localProvider = new MockRunPodProvider(config, () => clock);
+    const scheduler = createWorkerScheduler(config, localProvider, { store: unhealthyWorkerStore, now: () => clock });
+    const unhealthyApp = createApp(config, localProvider, { serveStatic: false, scheduler });
+
+    const response = await request(unhealthyApp).get("/api/health").expect(503);
+    expect(response.body).toMatchObject({
+      status: "degraded",
+      storage: { ready: true },
+      worker_pool: { ready: false },
+    });
   });
 
   it("rejects an invalid password", async () => {
@@ -58,6 +90,28 @@ describe("control API", () => {
     expect((await agent.get("/api/control/status").expect(200)).body.data.stage).toBe("stopped");
   });
 
+  it("never falls back to the legacy Pod for an explicitly configured worker pool", async () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      RUNPOD_PROVIDER: "mock",
+      RUNPOD_WORKERS_JSON: "[]",
+      CONTROL_PASSWORD: "test-password",
+      SESSION_SECRET: "test-session-secret-at-least-32-characters",
+      ALLOWED_ORIGIN: "http://localhost",
+    });
+    const localProvider = new MockRunPodProvider(config, () => clock);
+    const poolApp = createApp(config, localProvider, { serveStatic: false, now: () => clock });
+    const agent = request.agent(poolApp);
+    await agent.post("/api/session/login").set("origin", "http://localhost").send({ password: "test-password" }).expect(200);
+
+    const status = await agent.get("/api/control/status").expect(200);
+    expect(status.body.data).toMatchObject({ stage: "stopped", pod: null });
+    expect(status.body.data.pool.total_workers).toBe(0);
+    const start = await agent.post("/api/control/start").set("origin", "http://localhost").send({}).expect(409);
+    expect(start.body.error.code).toBe("worker_target_required");
+    expect(localProvider.startCalls).toBe(0);
+  });
+
   it("blocks a mutation from another origin", async () => {
     const agent = request.agent(app);
     await agent.post("/api/session/login").set("origin", "http://localhost").send({ password: "test-password" }).expect(200);
@@ -86,7 +140,7 @@ describe("control API", () => {
     expect(status.body.data.control).toEqual({ mode: "readonly", available: false });
     expect(status.body.data.pod.gpu).toEqual({ id: "A100-80GB", displayName: "NVIDIA A100 80GB", count: 1 });
     expect(status.body.data.service.health.catalog_terms).toBe(248);
-    expect(status.body.data.service.batchUrl).toBe("https://nhf73n5jvajgyj-8000.proxy.runpod.net/v1/transcribe");
+    expect(status.body.data.service.batchUrl).toBeUndefined();
 
     const start = await agent.post("/api/control/start").set("origin", "http://localhost").send({}).expect(503);
     expect(start.body.error.code).toBe("runpod_control_unavailable");
@@ -98,17 +152,24 @@ describe("control API", () => {
 
     const response = await agent.get("/api/models").expect(200);
     expect(response.body.data.default_model_id).toBe("infodeliverailab/qwen3-asr-ja-rlbr-context-fullft");
+    expect(response.body.data.items).toHaveLength(5);
     expect(response.body.data.items).toEqual(expect.arrayContaining([
       expect.objectContaining({
         id: "infodeliverailab/qwen3-asr-ja-rlbr-context-fullft",
         runtime: "realtime",
         input_modes: ["microphone", "file"],
+        selectable: true,
       }),
       expect.objectContaining({
         id: "infodeliverailab/qwen3-omni-jp-vllm",
         runtime: "batch",
         input_modes: ["file"],
+        selectable: false,
+        integration_status: "adapter_required",
       }),
+      expect.objectContaining({ id: "infodeliverailab/lab_asr_jp_1", selectable: false }),
+      expect.objectContaining({ id: "infodeliverailab/lab_asr_diarization_v1", selectable: false }),
+      expect.objectContaining({ id: "infodeliverailab/lab_asr_diarization_v2", selectable: false }),
     ]));
   });
 
@@ -121,6 +182,11 @@ describe("control API", () => {
       model_id: "infodeliverailab/diarization_model_0714_ytv2",
     }).expect(400);
     expect(response.body.error.code).toBe("validation_failed");
+
+    await agent.post("/api/transcriptions").set("origin", "http://localhost").send({
+      source: "file",
+      model_id: "infodeliverailab/qwen3-omni-jp-vllm",
+    }).expect(400);
   });
 
   it("persists, searches, renames, completes, and deletes transcription history", async () => {
@@ -155,12 +221,18 @@ describe("control API", () => {
       revision: 4,
       text: "あかつき証券の佐藤でございます。",
     }).expect(200);
+    await agent.put(`/api/transcriptions/${id}/utterances/utt-1`).set("origin", "http://localhost").send({
+      ...finalPayload,
+      revision: 2,
+      text: "古いoutbox再送で上書きしてはいけません。",
+    }).expect(200);
 
     const detail = await agent.get(`/api/transcriptions/${id}`).expect(200);
     expect(detail.body.data.title).toBe("あかつき証券の佐藤です。");
     expect(detail.body.data.utterance_count).toBe(1);
     expect(detail.body.data.utterances).toHaveLength(1);
     expect(detail.body.data.utterances[0].revision).toBe(4);
+    expect(detail.body.data.utterances[0].text).toBe("あかつき証券の佐藤でございます。");
 
     const search = await agent.get("/api/transcriptions").query({ q: "あかつき", limit: 10 }).expect(200);
     expect(search.body.data).toHaveLength(1);
@@ -178,6 +250,15 @@ describe("control API", () => {
     expect(completed.body.data.title_customized).toBe(true);
     expect(completed.body.data.status).toBe("completed");
     expect(completed.body.data.metrics.stable_latency_p95_ms).toBe(1180);
+
+    const lateFailure = await agent.post(`/api/transcriptions/${id}/complete`).set("origin", "http://localhost").send({
+      status: "failed",
+      duration_ms: 9999,
+      metrics: { stable_latency_p95_ms: 9999 },
+    }).expect(200);
+    expect(lateFailure.body.data.status).toBe("completed");
+    expect(lateFailure.body.data.duration_ms).toBe(1300);
+    expect(lateFailure.body.data.metrics.stable_latency_p95_ms).toBe(1180);
 
     await agent.delete(`/api/transcriptions/${id}`).set("origin", "http://localhost").expect(200);
     await agent.get(`/api/transcriptions/${id}`).expect(404);
