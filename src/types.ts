@@ -50,6 +50,91 @@ export interface ControlStatus {
 export type AssignmentPurpose = "realtime" | "batch";
 export type AssignmentStatus = "requested" | "provisioning" | "ready" | "active" | "released" | "failed";
 
+export type ProcessingMode = "realtime" | "batch" | "hybrid";
+
+export type PipelineNodeId =
+  | "audio_ingest"
+  | "vad"
+  | "context_asr"
+  | "streaming_sortformer"
+  | "endpoint"
+  | "lab_finalizer"
+  | "replace_result"
+  | "persist";
+
+export type PipelineStatus = "waiting" | "queued" | "running" | "completed" | "fallback" | "failed";
+export type PipelineWireStatus = Exclude<PipelineStatus, "waiting"> | "skipped";
+
+export interface ProcessingAssignmentProfile {
+  purpose: AssignmentPurpose;
+  model_id: string;
+}
+
+export interface ProcessingPipelineNode {
+  id: PipelineNodeId;
+  label: string;
+}
+
+export interface ProcessingPipelineEdge {
+  from: PipelineNodeId;
+  to: PipelineNodeId;
+}
+
+export type ProcessingProfileAvailabilityStatus =
+  | "configured"
+  | "provisionable"
+  | "setup_required"
+  | "unknown";
+
+export interface ProcessingProfileAvailability {
+  selectable: boolean;
+  configured: boolean | null;
+  provisionable: boolean | null;
+  validated: boolean;
+  status: ProcessingProfileAvailabilityStatus;
+}
+
+export interface ProcessingProfile {
+  id: ProcessingMode;
+  display_name: string;
+  description: string;
+  input_modes: AsrInputMode[];
+  primary_model_id: string;
+  final_model_id: string | null;
+  assignments: ProcessingAssignmentProfile[];
+  nodes: ProcessingPipelineNode[];
+  edges: ProcessingPipelineEdge[];
+  /** Optional during the rolling deployment where an older control plane may still answer. */
+  availability?: ProcessingProfileAvailability;
+}
+
+export interface PipelineStageEvent {
+  type: "pipeline.stage";
+  seq: number;
+  pipeline_id: string;
+  utterance_id: string;
+  stage: PipelineNodeId;
+  status: PipelineWireStatus;
+  audio_end_ms: number | null;
+  elapsed_ms: number | null;
+  detail_code: string | null;
+}
+
+export interface PipelineLogEntry extends Omit<PipelineStageEvent, "status" | "seq"> {
+  seq: number | null;
+  status: PipelineStatus;
+  received_at: string;
+  source: "worker" | "client";
+}
+
+export interface RealtimeCapabilities {
+  pipeline_events: boolean;
+  input_end: boolean;
+  partial_transcripts: boolean;
+  speaker_hints: boolean;
+  final_word_timestamps: boolean;
+}
+
 export interface AssignedWorker {
   id: string;
   pod_id: string;
@@ -103,6 +188,8 @@ export interface AsrModel {
 export interface AsrModelCatalog {
   items: AsrModel[];
   default_model_id: string;
+  processing_modes: ProcessingProfile[];
+  default_processing_mode: ProcessingMode;
 }
 
 export interface PartialEvent {
@@ -134,7 +221,11 @@ export interface FinalEvent {
   text: string;
   words?: WordInfo[];
   context_hits?: string[];
+  audio_start_ms?: number;
   audio_end_ms?: number;
+  authoritative?: boolean;
+  finalization_status?: "pending" | "authoritative" | "fallback";
+  speaker_turns?: WordInfo[];
   latency_ms?: number;
   queue_ms?: number;
   rtf?: number;
@@ -158,7 +249,9 @@ export interface TranscriptionSession {
   title_customized: boolean;
   status: TranscriptionStatus;
   source: TranscriptSource;
+  processing_mode: ProcessingMode;
   model_id: string;
+  final_model_id: string | null;
   catalog_revision: string;
   started_at: string;
   ended_at: string | null;
@@ -181,6 +274,7 @@ export interface TranscriptUtterance {
   text: string;
   words: WordInfo[];
   context_hits: string[];
+  audio_start_ms: number;
   audio_end_ms: number;
   latency_ms: number | null;
   queue_ms: number | null;
@@ -207,6 +301,7 @@ export interface PersistUtteranceInput {
   text: string;
   words: WordInfo[];
   context_hits: string[];
+  audio_start_ms?: number;
   audio_end_ms: number;
   latency_ms: number | null;
   queue_ms: number | null;

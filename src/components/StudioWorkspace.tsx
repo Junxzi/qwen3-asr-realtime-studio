@@ -21,11 +21,16 @@ import {
 } from "@/assignment";
 import { AppShell } from "@/components/AppShell";
 import { AudioComposer } from "@/components/AudioComposer";
-import { Conversation, type ConversationItem } from "@/components/Conversation";
+import { Conversation } from "@/components/Conversation";
 import { DiagnosticsDrawer } from "@/components/DiagnosticsDrawer";
-import { ModelPicker } from "@/components/ModelPicker";
+import { ProcessingModePicker } from "@/components/ProcessingModePicker";
 import { Sidebar } from "@/components/Sidebar";
 import { Button } from "@/components/ui/button";
+import {
+  historyConversationItems,
+  liveConversationItems,
+  type ConversationItem,
+} from "@/conversationProjection";
 import { percentile } from "@/lib/format";
 import {
   enqueueOutbox,
@@ -35,20 +40,23 @@ import {
   removeOutbox,
   removeSessionOutbox,
 } from "@/outbox";
+import { saveUtteranceWithTimeout, shouldReportFinalPersistence } from "@/saveUtterance";
 import type {
+  AssignmentPurpose,
   ControlStatus,
   FinalEvent,
   InferenceAssignment,
   PersistUtteranceInput,
+  ProcessingMode,
+  ProcessingProfile,
   TranscriptSource,
   TranscriptionMetrics,
   TranscriptionSession,
 } from "@/types";
+import type { ClientPipelineEvent } from "@/pipeline";
 import { retryTerminalCompletion, SessionTerminalizationLatch } from "@/terminalization";
 import { useAssignmentHeartbeat } from "@/useAssignmentHeartbeat";
 import { useRealtime } from "@/useRealtime";
-
-const MODEL_ID = "infodeliverailab/qwen3-asr-ja-rlbr-context-fullft";
 
 function finalPayload(event: FinalEvent): PersistUtteranceInput {
   return {
@@ -56,6 +64,7 @@ function finalPayload(event: FinalEvent): PersistUtteranceInput {
     text: event.text,
     words: event.words || [],
     context_hits: event.context_hits || [],
+    audio_start_ms: event.audio_start_ms ?? 0,
     audio_end_ms: event.audio_end_ms || event.words?.at(-1)?.end_ms || 0,
     latency_ms: event.latency_ms ?? null,
     queue_ms: event.queue_ms ?? null,
@@ -73,19 +82,6 @@ function liveMetrics(finals: FinalEvent[], firstTokenMs: number | null): Transcr
     rtf: rtfValues.length ? rtfValues.reduce((sum, value) => sum + value, 0) / rtfValues.length : null,
     context_hits: finals.reduce((count, item) => count + (item.context_hits?.length || 0), 0),
   };
-}
-
-function liveConversationItems(finals: FinalEvent[], startedAt?: string): ConversationItem[] {
-  return finals.map((item, index) => ({
-    id: item.utterance_id,
-    speaker: item.words?.[0]?.speaker || (index % 2 ? "speaker_2" : "speaker_1"),
-    text: item.text,
-    words: item.words || [],
-    audioEndMs: item.audio_end_ms || item.words?.at(-1)?.end_ms || 0,
-    createdAt: startedAt || new Date().toISOString(),
-    contextHits: item.context_hits || [],
-    latencyMs: item.latency_ms ?? null,
-  }));
 }
 
 interface StudioWorkspaceProps {
@@ -114,8 +110,8 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
   const [terminalCompletionPending, setTerminalCompletionPending] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
   const [pendingSaves, setPendingSaves] = useState(0);
-  const [selectedModelId, setSelectedModelId] = useState(MODEL_ID);
-  const [assignment, setAssignment] = useState<InferenceAssignment | null>(null);
+  const [selectedProcessingMode, setSelectedProcessingMode] = useState<ProcessingMode>("realtime");
+  const [assignments, setAssignments] = useState<Partial<Record<AssignmentPurpose, InferenceAssignment>>>({});
   const [clock, setClock] = useState(Date.now());
   const activeSessionRef = useRef<TranscriptionSession | null>(null);
   const startedAtRef = useRef<number | null>(null);
@@ -126,6 +122,7 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
   const terminalizationRef = useRef(new SessionTerminalizationLatch());
   const terminalStatusRef = useRef<"completed" | "interrupted" | "failed" | null>(null);
   const unexpectedDisconnectHandlerRef = useRef<(error: Error, sessionId: string) => void>(() => undefined);
+  const pipelineRecorderRef = useRef<(event: Omit<ClientPipelineEvent, "receivedAt">) => void>(() => undefined);
 
   const history = useQuery({
     queryKey: ["transcriptions", deferredSearch],
@@ -144,16 +141,21 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
     staleTime: Number.POSITIVE_INFINITY,
   });
   const models = modelCatalog.data?.items || [];
+  const processingModes = modelCatalog.data?.processing_modes || [];
+  const sessionProcessingMode = historyId
+    ? (detail.data?.processing_mode || selectedProcessingMode)
+    : (activeSession?.processing_mode || selectedProcessingMode);
+  const selectedProcessingProfile = processingModes.find((mode) => mode.id === sessionProcessingMode);
   const sessionModelId = historyId
-    ? (detail.data?.model_id || selectedModelId)
-    : (activeSession?.model_id || selectedModelId);
+    ? (detail.data?.model_id || selectedProcessingProfile?.primary_model_id)
+    : (activeSession?.model_id || selectedProcessingProfile?.primary_model_id);
   const selectedModel = models.find((model) => model.id === sessionModelId);
 
   useEffect(() => {
     const catalog = modelCatalog.data;
-    if (!catalog || catalog.items.some((model) => model.id === selectedModelId)) return;
-    setSelectedModelId(catalog.default_model_id);
-  }, [modelCatalog.data, selectedModelId]);
+    if (!catalog || catalog.processing_modes.some((mode) => mode.id === selectedProcessingMode)) return;
+    setSelectedProcessingMode(catalog.default_processing_mode);
+  }, [modelCatalog.data, selectedProcessingMode]);
 
   const refreshPending = useCallback(async () => {
     setPendingSaves((await listOutbox()).length);
@@ -162,11 +164,42 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
   const persistFinal = useCallback((event: FinalEvent, sessionId: string) => {
     const task = (async () => {
       const payload = finalPayload(event);
+      const terminalResult = shouldReportFinalPersistence(event);
+      if (terminalResult) {
+        pipelineRecorderRef.current({
+          utteranceId: event.utterance_id,
+          stage: "persist",
+          status: "running",
+          pipelineId: activeSessionRef.current?.processing_mode,
+          audioEndMs: event.audio_end_ms,
+          detailCode: "save_started",
+        });
+      }
       try {
-        await api.saveUtterance(sessionId, event.utterance_id, payload);
-        await removeOutbox(outboxKey(sessionId, event.utterance_id));
+        await saveUtteranceWithTimeout(sessionId, event.utterance_id, payload);
+        await removeOutbox(outboxKey(sessionId, event.utterance_id, payload.revision));
+        if (terminalResult) {
+          pipelineRecorderRef.current({
+            utteranceId: event.utterance_id,
+            stage: "persist",
+            status: "completed",
+            pipelineId: activeSessionRef.current?.processing_mode,
+            audioEndMs: event.audio_end_ms,
+            detailCode: "save_completed",
+          });
+        }
       } catch {
         await enqueueOutbox(sessionId, event.utterance_id, payload);
+        if (terminalResult) {
+          pipelineRecorderRef.current({
+            utteranceId: event.utterance_id,
+            stage: "persist",
+            status: "queued",
+            pipelineId: activeSessionRef.current?.processing_mode,
+            audioEndMs: event.audio_end_ms,
+            detailCode: "outbox_queued",
+          });
+        }
       } finally {
         await refreshPending();
         await queryClient.invalidateQueries({ queryKey: ["transcriptions"] });
@@ -181,7 +214,9 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
     selectedModel,
     persistFinal,
     (error, sessionId) => unexpectedDisconnectHandlerRef.current(error, sessionId),
+    selectedProcessingProfile,
   );
+  pipelineRecorderRef.current = realtime.recordPipeline;
   const {
     start: startAssignmentHeartbeat,
     stop: stopAssignmentHeartbeat,
@@ -194,7 +229,9 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
   );
 
   const flushPending = useCallback(async () => {
-    const result = await flushOutbox((item) => api.saveUtterance(item.sessionId, item.utteranceId, item.payload));
+    const result = await flushOutbox((item) => (
+      saveUtteranceWithTimeout(item.sessionId, item.utteranceId, item.payload)
+    ));
     setPendingSaves(result.pending);
     if (result.saved) {
       await queryClient.invalidateQueries({ queryKey: ["transcriptions"] });
@@ -248,14 +285,19 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
   useEffect(() => () => assignmentAbortRef.current?.abort(), []);
 
   const createSession = async (source: TranscriptSource) => {
-    if (!selectedModel) throw new Error("文字起こしモデルを読み込んでいます");
+    const profile = selectedProcessingProfile;
+    if (!profile) throw new Error("処理方式を読み込んでいます");
+    const requiredInput = source === "microphone" ? "microphone" : "file";
+    if (!profile.input_modes.includes(requiredInput)) throw new Error("選択した処理方式はこの入力に対応していません");
     realtime.reset();
-    setAssignment(null);
+    setAssignments({});
     setWorkspaceError("");
     setTerminalCompletionPending(false);
     const session = await api.createTranscription({
       source,
-      model_id: selectedModel.id,
+      processing_mode: profile.id,
+      model_id: profile.primary_model_id,
+      final_model_id: profile.final_model_id,
       catalog_revision: "",
     });
     setActiveSession(session);
@@ -268,24 +310,30 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
     return session;
   };
 
-  const assignWorker = async (session: TranscriptionSession, controller: AbortController) => {
-    if (!selectedModel) throw new Error("文字起こしモデルを読み込んでいます");
+  const assignWorkers = async (
+    session: TranscriptionSession,
+    profile: ProcessingProfile,
+    controller: AbortController,
+  ) => {
     assignmentAbortRef.current?.abort();
     assignmentAbortRef.current = controller;
-    const purpose = selectedModel.runtime;
-    let current = await api.requestAssignment(session.id, purpose, controller.signal);
-    assertAssignmentMatches(current, session);
-    setAssignment(current);
-    while (!assignmentIsReady(current)) {
-      if (current.status === "failed") throw new Error(assignmentMessage(current, selectedModel.display_name));
-      if (current.status === "released") throw new Error("GPUの割り当てが処理開始前に解放されました");
-      await waitForAssignmentPoll(assignmentPollDelay(current), controller.signal);
-      current = await api.requestAssignment(session.id, purpose, controller.signal);
-      assertAssignmentMatches(current, session);
-      setAssignment(current);
-    }
-    requireAssignmentConnection(current, purpose);
-    return current;
+    const pairs = await Promise.all(profile.assignments.map(async ({ purpose, model_id: modelId }) => {
+      const modelName = models.find((candidate) => candidate.id === modelId)?.display_name;
+      let current = await api.requestAssignment(session.id, purpose, controller.signal);
+      assertAssignmentMatches(current, session, modelId);
+      setAssignments((existing) => ({ ...existing, [purpose]: current }));
+      while (!assignmentIsReady(current)) {
+        if (current.status === "failed") throw new Error(assignmentMessage(current, modelName));
+        if (current.status === "released") throw new Error("GPUの割り当てが処理開始前に解放されました");
+        await waitForAssignmentPoll(assignmentPollDelay(current), controller.signal);
+        current = await api.requestAssignment(session.id, purpose, controller.signal);
+        assertAssignmentMatches(current, session, modelId);
+        setAssignments((existing) => ({ ...existing, [purpose]: current }));
+      }
+      requireAssignmentConnection(current, purpose);
+      return [purpose, current] as const;
+    }));
+    return Object.fromEntries(pairs) as Partial<Record<AssignmentPurpose, InferenceAssignment>>;
   };
 
   const completeActive = (
@@ -321,7 +369,7 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
         if (completed && activeSessionRef.current?.id === session.id) {
           activeSessionRef.current = null;
           setActiveSession(null);
-          setAssignment(null);
+          setAssignments({});
           startedAtRef.current = null;
           terminalStatusRef.current = null;
         }
@@ -358,17 +406,19 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
   };
 
   const startMicrophone = async () => {
-    if (operationLockRef.current || !selectedModel?.input_modes.includes("microphone")) return;
+    const profile = selectedProcessingProfile;
+    if (operationLockRef.current || !profile?.input_modes.includes("microphone")) return;
     operationLockRef.current = true;
     const operationGeneration = ++operationGenerationRef.current;
     const controller = new AbortController();
     setOperationBusy(true);
     try {
       const session = await createSession("microphone");
-      const assigned = await assignWorker(session, controller);
+      const assigned = await assignWorkers(session, profile, controller);
       if (operationGeneration !== operationGenerationRef.current) return;
-      startAssignmentHeartbeat(session.id);
-      await realtime.startMicrophone(session, assigned);
+      if (!assigned.realtime) throw new Error("リアルタイムGPUを割り当てできませんでした");
+      startAssignmentHeartbeat(session.id, profile);
+      await realtime.startMicrophone(session, assigned.realtime, assigned.batch);
       if (operationGeneration !== operationGenerationRef.current) {
         await realtime.disconnect();
         return;
@@ -390,17 +440,20 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
   };
 
   const startFile = async (file: File) => {
-    if (operationLockRef.current || !selectedModel?.input_modes.includes("file")) return;
+    const profile = selectedProcessingProfile;
+    if (operationLockRef.current || !profile?.input_modes.includes("file")) return;
     operationLockRef.current = true;
     const operationGeneration = ++operationGenerationRef.current;
     const controller = new AbortController();
     setOperationBusy(true);
     try {
       const session = await createSession("file");
-      const assigned = await assignWorker(session, controller);
+      const assigned = await assignWorkers(session, profile, controller);
       if (operationGeneration !== operationGenerationRef.current) return;
-      startAssignmentHeartbeat(session.id);
-      await realtime.startFile(session, file, assigned, controller.signal);
+      const primaryAssignment = profile.id === "batch" ? assigned.batch : assigned.realtime;
+      if (!primaryAssignment) throw new Error("処理用GPUを割り当てできませんでした");
+      startAssignmentHeartbeat(session.id, profile);
+      await realtime.startFile(session, file, primaryAssignment, controller.signal, assigned.batch);
       if (operationGeneration !== operationGenerationRef.current) return;
       await completeActive("completed");
       toast.success("音声ファイルの文字起こしを完了しました");
@@ -508,18 +561,14 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
       ? Math.max(0, clock - startedAtRef.current)
       : 0;
   const conversationItems: ConversationItem[] = historyId
-    ? (detail.data?.utterances || []).map((utterance) => ({
-      id: utterance.id,
-      speaker: utterance.speaker,
-      text: utterance.text,
-      words: utterance.words,
-      audioEndMs: utterance.audio_end_ms,
-      createdAt: utterance.created_at,
-      contextHits: utterance.context_hits,
-      latencyMs: utterance.latency_ms,
-    }))
+    ? historyConversationItems(detail.data?.utterances || [])
     : liveConversationItems(realtime.finals, activeSession?.started_at);
   const busy = operationBusy || realtime.capturing || realtime.finalizing || realtime.finalizationBlocked;
+  const selectedAssignment = sessionProcessingMode === "batch"
+    ? assignments.batch
+    : assignments.realtime || assignments.batch;
+  const diagnosticAssignments = [assignments.realtime, assignments.batch]
+    .filter((item): item is InferenceAssignment => Boolean(item));
 
   const sidebar = (
     <Sidebar
@@ -533,7 +582,7 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
       onNew={() => {
         if (!busy) {
           realtime.reset();
-          setAssignment(null);
+          setAssignments({});
           setWorkspaceError("");
           navigate("/");
         }
@@ -553,14 +602,14 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
       statusError={statusError}
       sidebar={sidebar}
       modelControl={(
-        <ModelPicker
-          models={models}
-          value={sessionModelId}
+        <ProcessingModePicker
+          modes={processingModes}
+          value={sessionProcessingMode}
           disabled={busy || modelCatalog.isPending}
           readOnly={Boolean(historyId)}
-          onChange={(modelId) => {
-            const next = models.find((model) => model.id === modelId);
-            setSelectedModelId(modelId);
+          onChange={(mode) => {
+            const next = processingModes.find((candidate) => candidate.id === mode);
+            setSelectedProcessingMode(mode);
             if (next) toast.message(`${next.display_name}を選択しました`);
           }}
         />
@@ -578,6 +627,7 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
           loading={Boolean(historyId && detail.isPending)}
           error={workspaceError || realtime.error || detail.error?.message}
           model={selectedModel}
+          processingProfile={selectedProcessingProfile}
         />
         {historyId ? (
           <div className="history-readonly-bar">
@@ -591,7 +641,7 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
           </div>
         ) : (
           <AudioComposer
-            assignment={assignment}
+            assignment={selectedAssignment}
             connection={realtime.connection}
             capturing={realtime.capturing}
             finalizing={realtime.finalizing}
@@ -602,6 +652,7 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
             pendingSaves={pendingSaves}
             sourceLabel={realtime.sourceLabel}
             model={selectedModel}
+            processingProfile={selectedProcessingProfile}
             onMicrophone={() => void startMicrophone()}
             onFile={(file) => void startFile(file)}
             onStop={() => void stopMicrophone()}
@@ -615,13 +666,15 @@ export function StudioWorkspace({ status, statusError, onRefreshStatus, onLogout
         onOpenChange={setDiagnosticsOpen}
         status={status}
         statusError={statusError}
-        assignment={historyId ? null : assignment}
+        assignments={historyId ? [] : diagnosticAssignments}
         connection={historyId ? "disconnected" : realtime.connection}
         elapsedMs={elapsedMs}
         metrics={metrics}
-        events={historyId ? [] : realtime.events}
+        pipeline={realtime.pipeline}
         pendingSaves={pendingSaves}
         model={selectedModel}
+        processingProfile={selectedProcessingProfile}
+        live={!historyId}
         onRefresh={onRefreshStatus}
       />
     </AppShell>

@@ -2,19 +2,11 @@ import { motion, useReducedMotion } from "motion/react";
 import { FileAudio, Mic, WifiOff } from "lucide-react";
 import { useEffect, useRef } from "react";
 import { Skeleton } from "@/components/ui/skeleton";
+import type { ConversationItem } from "@/conversationProjection";
 import { formatTime, speakerNumber } from "@/lib/format";
-import type { AsrModel, ControlStage, PartialEvent, WordInfo } from "@/types";
+import type { AsrModel, ControlStage, PartialEvent, ProcessingProfile } from "@/types";
 
-export interface ConversationItem {
-  id: string;
-  speaker: string;
-  text: string;
-  words: WordInfo[];
-  audioEndMs: number;
-  createdAt: string;
-  contextHits: string[];
-  latencyMs: number | null;
-}
+export type { ConversationItem } from "@/conversationProjection";
 
 interface ConversationProps {
   items: ConversationItem[];
@@ -25,9 +17,20 @@ interface ConversationProps {
   loading?: boolean;
   error?: string;
   model?: AsrModel;
+  processingProfile?: ProcessingProfile;
 }
 
-function EmptyConversation({ stage, error, model }: { stage?: ControlStage; error?: string; model?: AsrModel }) {
+function EmptyConversation({
+  stage,
+  error,
+  model,
+  processingProfile,
+}: {
+  stage?: ControlStage;
+  error?: string;
+  model?: AsrModel;
+  processingProfile?: ProcessingProfile;
+}) {
   if (error) {
     return (
       <div className="conversation-empty conversation-empty--error" role="alert">
@@ -37,7 +40,7 @@ function EmptyConversation({ stage, error, model }: { stage?: ControlStage; erro
       </div>
     );
   }
-  const supportsMicrophone = Boolean(model?.input_modes.includes("microphone"));
+  const supportsMicrophone = Boolean((processingProfile?.input_modes || model?.input_modes)?.includes("microphone"));
   return (
     <div className="conversation-empty">
       <span className="empty-icon-pair">{supportsMicrophone ? <Mic /> : null}<FileAudio /></span>
@@ -60,7 +63,7 @@ function Bubble({
 }) {
   const reducedMotion = useReducedMotion();
   const speaker = speakerNumber(item.speaker);
-  const offset = item.words[0]?.start_ms ?? Math.max(0, item.audioEndMs - 1000);
+  const offset = item.audioStartMs;
   return (
     <motion.article
       className={`transcript-message transcript-message--speaker-${speaker % 2 === 0 ? "even" : "odd"}`}
@@ -72,7 +75,10 @@ function Bubble({
         <span>{speaker}</span>
         <strong>話者 {speaker}</strong>
         <time>{formatTime(startedAt || item.createdAt, startedAt ? offset : 0)}</time>
-        {live ? <small><i />ライブ</small> : null}
+        {item.provisional
+          ? <small><i />高精度確定中</small>
+          : item.fallback ? <small><i />高精度失敗・リアルタイム確定</small>
+          : live ? <small><i />ライブ</small> : null}
       </div>
       <div className="message-bubble">
         <p>{item.text}</p>
@@ -95,6 +101,7 @@ export function Conversation({
   loading,
   error,
   model,
+  processingProfile,
 }: ConversationProps) {
   const endRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -115,13 +122,13 @@ export function Conversation({
   }
 
   if (!items.length && !partial) {
-    return <EmptyConversation stage={stage} error={error} model={model} />;
+    return <EmptyConversation stage={stage} error={error} model={model} processingProfile={processingProfile} />;
   }
 
   return (
     <div className="conversation-scroll">
       <div className="conversation-column">
-        {items.map((item) => <Bubble key={item.id} item={item} startedAt={startedAt} />)}
+        {items.map((item) => <Bubble key={item.id} item={item} startedAt={startedAt} live={live} />)}
         {partial ? (
           <article className={`transcript-message transcript-message--live transcript-message--speaker-${speakerNumber(partial.speaker_hint) % 2 === 0 ? "even" : "odd"}`}>
             <div className="speaker-meta">

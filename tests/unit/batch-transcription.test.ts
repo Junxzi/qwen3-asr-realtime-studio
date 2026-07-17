@@ -28,7 +28,7 @@ describe("batch transcription conversion", () => {
       utterances: [{
         utterance_id: "utt-omni-1",
         text: "あかつき証券です。",
-        speaker: "speaker_1",
+        speaker: "speaker_0",
         start_ms: 100,
         end_ms: 1700,
         confidence: 0.96,
