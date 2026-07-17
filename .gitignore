@@ -1,0 +1,37 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+coverage/
+*.log
+.DS_Store
+
+# Local runtime and agent state
+.agents/
+.codex/
+.tools/
+outputs/
+work/
+
+# Audio and model artifacts are not stored in GitHub
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+models/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Local caches and editor files
+.cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.idea/
+.vscode/
+Thumbs.db
