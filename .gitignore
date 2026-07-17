@@ -31,6 +31,7 @@ checkpoints/
 .cache/
 .pytest_cache/
 __pycache__/
+.venv/
 *.py[cod]
 .idea/
 .vscode/

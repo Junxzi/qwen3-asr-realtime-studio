@@ -1,5 +1,5 @@
 import { motion, useReducedMotion } from "motion/react";
-import { FileAudio, Mic, Radio, WifiOff } from "lucide-react";
+import { FileAudio, Mic, WifiOff } from "lucide-react";
 import { useEffect, useRef } from "react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatTime, speakerNumber } from "@/lib/format";
@@ -20,14 +20,14 @@ interface ConversationProps {
   items: ConversationItem[];
   partial: PartialEvent | null;
   startedAt?: string;
-  stage: ControlStage;
+  stage?: ControlStage;
   live: boolean;
   loading?: boolean;
   error?: string;
   model?: AsrModel;
 }
 
-function EmptyConversation({ stage, error, model }: { stage: ControlStage; error?: string; model?: AsrModel }) {
+function EmptyConversation({ stage, error, model }: { stage?: ControlStage; error?: string; model?: AsrModel }) {
   if (error) {
     return (
       <div className="conversation-empty conversation-empty--error" role="alert">
@@ -37,21 +37,14 @@ function EmptyConversation({ stage, error, model }: { stage: ControlStage; error
       </div>
     );
   }
-  if (stage !== "ready") {
-    return (
-      <div className="conversation-empty">
-        <Radio />
-        <strong>GPUサービスは現在オフラインです</strong>
-        <p>RunPodでGPUを起動すると、この画面が自動的に利用可能になります。</p>
-      </div>
-    );
-  }
   const supportsMicrophone = Boolean(model?.input_modes.includes("microphone"));
   return (
     <div className="conversation-empty">
       <span className="empty-icon-pair">{supportsMicrophone ? <Mic /> : null}<FileAudio /></span>
       <strong>新しい文字起こしを開始</strong>
-      <p>{supportsMicrophone ? "下部のマイク、または音声ファイルから開始してください。" : "下部から音声ファイルを選択してください。"}</p>
+      <p>{stage === "ready"
+        ? (supportsMicrophone ? "下部のマイク、または音声ファイルから開始してください。" : "下部から音声ファイルを選択してください。")
+        : "開始すると利用可能なGPUを割り当て、選択モデルを準備します。"}</p>
     </div>
   );
 }

@@ -61,26 +61,17 @@ export default function App() {
   if (session.error) {
     return <FatalState title="ASR Studioを読み込めません" message={session.error.message} retry={() => void session.refetch()} />;
   }
-  if (status.isPending) return <AppSkeleton />;
-  if (status.error || !status.data) {
-    return (
-      <FatalState
-        title="RunPodの状態を取得できません"
-        message={status.error?.message || "状態応答が空です"}
-        retry={() => void status.refetch()}
-      />
-    );
-  }
+  const statusError = status.error?.message;
 
   return (
     <Routes>
       <Route
         path="/"
-        element={<StudioWorkspace status={status.data} onRefreshStatus={() => void status.refetch()} onLogout={() => logout.mutate()} />}
+        element={<StudioWorkspace status={status.data} statusError={statusError} onRefreshStatus={() => void status.refetch()} onLogout={() => logout.mutate()} />}
       />
       <Route
         path="/transcriptions/:id"
-        element={<StudioWorkspace status={status.data} onRefreshStatus={() => void status.refetch()} onLogout={() => logout.mutate()} />}
+        element={<StudioWorkspace status={status.data} statusError={statusError} onRefreshStatus={() => void status.refetch()} onLogout={() => logout.mutate()} />}
       />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

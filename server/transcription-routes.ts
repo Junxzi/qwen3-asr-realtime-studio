@@ -4,6 +4,7 @@ import { z } from "zod";
 import { DEFAULT_ASR_MODEL_ID, isSupportedAsrModel } from "./asr-models.js";
 import type { AppConfig } from "./config.js";
 import type { TranscriptionStore } from "./transcriptions.js";
+import type { WorkerScheduler } from "./worker-scheduler.js";
 
 const sourceSchema = z.enum(["microphone", "file"]);
 const wordSchema = z.object({
@@ -60,6 +61,7 @@ export function registerTranscriptionRoutes(
   authenticated: RequestHandler,
   allowedOrigin: RequestHandler,
   now: () => number,
+  scheduler?: WorkerScheduler,
 ) {
   app.get("/api/transcriptions", authenticated, async (request, response, next) => {
     try {
@@ -156,6 +158,7 @@ export function registerTranscriptionRoutes(
         });
         return;
       }
+      await scheduler?.touch(sessionId);
       response.json({ data: utterance });
     } catch (error) {
       next(error);
@@ -178,6 +181,7 @@ export function registerTranscriptionRoutes(
         });
         return;
       }
+      await scheduler?.release(id);
       response.json({ data: session });
     } catch (error) {
       next(error);
@@ -187,6 +191,7 @@ export function registerTranscriptionRoutes(
   app.delete("/api/transcriptions/:id", authenticated, allowedOrigin, async (request, response, next) => {
     try {
       const id = idSchema.parse(request.params.id);
+      await scheduler?.release(id);
       const deleted = await store.delete(id);
       if (!deleted) {
         response.status(404).json({

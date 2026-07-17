@@ -7,7 +7,8 @@ import type { ControlStatus } from "@/types";
 
 interface AppShellProps {
   title: string;
-  status: ControlStatus;
+  status?: ControlStatus;
+  statusError?: string;
   sidebar: ReactNode;
   modelControl: ReactNode;
   children: ReactNode;
@@ -15,11 +16,20 @@ interface AppShellProps {
   diagnosticsOpen: boolean;
 }
 
-export function AppShell({ title, status, sidebar, modelControl, children, onDiagnostics, diagnosticsOpen }: AppShellProps) {
+export function AppShell({ title, status, statusError, sidebar, modelControl, children, onDiagnostics, diagnosticsOpen }: AppShellProps) {
   const [desktopSidebarOpen, setDesktopSidebarOpen] = useState(true);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [mobileViewport, setMobileViewport] = useState(() => window.matchMedia("(max-width: 820px)").matches);
-  const healthy = status.stage === "ready";
+  const healthy = status?.pool ? status.pool.ready_workers > 0 : status?.stage === "ready";
+  const poolLabel = statusError
+    ? "GPU 状態不明"
+    : !status
+      ? "GPU 確認中"
+      : status.pool
+        ? `GPU ${status.pool.ready_workers}/${status.pool.total_workers} ready`
+        : healthy
+          ? "GPU 健康"
+          : "GPU 待機中";
   const sidebarOpen = mobileViewport ? mobileSidebarOpen : desktopSidebarOpen;
 
   useEffect(() => {
@@ -67,7 +77,7 @@ export function AppShell({ title, status, sidebar, modelControl, children, onDia
             <h1 title={title}>{title}</h1>
             <div className="header-status">
               {modelControl}
-              <span className={`gpu-health ${healthy ? "is-healthy" : ""}`}><i />{healthy ? "GPU 健康" : "GPU オフライン"}</span>
+              <span className={`gpu-health ${healthy ? "is-healthy" : ""}`} title={statusError}><i />{poolLabel}</span>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button

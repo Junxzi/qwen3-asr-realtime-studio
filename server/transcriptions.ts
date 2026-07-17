@@ -105,9 +105,11 @@ export interface TranscriptionStore {
   create(input: CreateTranscriptionInput): Promise<TranscriptionSession>;
   get(id: string, now: Date): Promise<TranscriptionDetail | null>;
   rename(id: string, title: string, now: Date): Promise<TranscriptionSession | null>;
+  setCatalogRevision(id: string, catalogRevision: string, now: Date): Promise<TranscriptionSession | null>;
   upsertUtterance(sessionId: string, input: UpsertUtteranceInput): Promise<TranscriptUtterance | null>;
   complete(id: string, input: CompleteTranscriptionInput): Promise<TranscriptionSession | null>;
   delete(id: string): Promise<boolean>;
+  listMaintenanceCandidates(now: Date, staleMinutes: number): Promise<string[]>;
   deleteExpired(now: Date): Promise<number>;
   markStale(now: Date, staleMinutes: number): Promise<number>;
   close(): Promise<void>;
@@ -252,6 +254,14 @@ export class MemoryTranscriptionStore implements TranscriptionStore {
     return cloneSession(session);
   }
 
+  async setCatalogRevision(id: string, catalogRevision: string, now: Date) {
+    const session = this.sessions.get(id);
+    if (!session) return null;
+    session.catalog_revision = catalogRevision;
+    session.updated_at = now.toISOString();
+    return cloneSession(session);
+  }
+
   async upsertUtterance(sessionId: string, input: UpsertUtteranceInput) {
     const session = this.sessions.get(sessionId);
     if (!session) return null;
@@ -259,6 +269,7 @@ export class MemoryTranscriptionStore implements TranscriptionStore {
     const existing = values.find((utterance) => utterance.utterance_id === input.utteranceId);
     const timestamp = input.now.toISOString();
     if (existing) {
+      if (input.revision < existing.revision) return cloneUtterance(existing);
       Object.assign(existing, {
         revision: input.revision,
         speaker: representativeSpeaker(input.words),
@@ -304,6 +315,9 @@ export class MemoryTranscriptionStore implements TranscriptionStore {
   async complete(id: string, input: CompleteTranscriptionInput) {
     const session = this.sessions.get(id);
     if (!session) return null;
+    // Completion can race a late WebSocket close callback. The first terminal
+    // transition owns the immutable session outcome; retries remain idempotent.
+    if (session.status !== "recording") return cloneSession(session);
     session.status = input.status;
     session.ended_at = input.now.toISOString();
     session.last_activity_at = input.now.toISOString();
@@ -317,6 +331,14 @@ export class MemoryTranscriptionStore implements TranscriptionStore {
     const existed = this.sessions.delete(id);
     this.utterances.delete(id);
     return existed;
+  }
+
+  async listMaintenanceCandidates(now: Date, staleMinutes: number) {
+    const staleThreshold = now.getTime() - staleMinutes * 60_000;
+    return [...this.sessions.values()]
+      .filter((session) => Date.parse(session.expires_at) < now.getTime()
+        || (session.status === "recording" && Date.parse(session.last_activity_at) < staleThreshold))
+      .map((session) => session.id);
   }
 
   async deleteExpired(now: Date) {
@@ -348,7 +370,16 @@ export class MemoryTranscriptionStore implements TranscriptionStore {
   async close() {}
 }
 
-export async function runRetentionMaintenance(store: TranscriptionStore, config: AppConfig, now = new Date()) {
+export async function runRetentionMaintenance(
+  store: TranscriptionStore,
+  config: AppConfig,
+  now = new Date(),
+  beforeFinalize?: (sessionId: string) => Promise<unknown>,
+) {
+  if (beforeFinalize) {
+    const candidates = await store.listMaintenanceCandidates(now, config.transcriptStaleMinutes);
+    await Promise.all(candidates.map((sessionId) => beforeFinalize(sessionId)));
+  }
   const [expired, stale] = await Promise.all([
     store.deleteExpired(now),
     store.markStale(now, config.transcriptStaleMinutes),

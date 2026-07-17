@@ -29,6 +29,7 @@ function option(model: AsrModel) {
           {model.runtime === "realtime" ? "リアルタイム" : "ファイル一括"}
           {" · "}
           {model.estimated_vram_gb}GB+
+          {!model.selectable ? " · 検証準備中" : ""}
         </small>
       </span>
     </span>
@@ -59,7 +60,7 @@ export function ModelPicker({ models, value, disabled, readOnly, onChange }: Mod
           <SelectGroup>
             <SelectLabel>リアルタイム向け</SelectLabel>
             {realtimeModels.map((model) => (
-              <SelectItem key={model.id} value={model.id} textValue={model.display_name}>
+              <SelectItem key={model.id} value={model.id} textValue={model.display_name} disabled={!model.selectable}>
                 {option(model)}
               </SelectItem>
             ))}
@@ -69,7 +70,7 @@ export function ModelPicker({ models, value, disabled, readOnly, onChange }: Mod
           <SelectGroup>
             <SelectLabel>高品質・ファイル向け</SelectLabel>
             {batchModels.map((model) => (
-              <SelectItem key={model.id} value={model.id} textValue={model.display_name}>
+              <SelectItem key={model.id} value={model.id} textValue={model.display_name} disabled={!model.selectable}>
                 {option(model)}
               </SelectItem>
             ))}

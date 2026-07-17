@@ -36,7 +36,7 @@ export function floatToPcm(samples: Float32Array) {
   return pcm.buffer;
 }
 
-export function sessionStart(sessionId: string, catalogRevision: string, modelId: string) {
+export function sessionStart(sessionId: string, catalogRevision: string, modelId: string, connectionTicket: string) {
   return {
     type: "session.start" as const,
     session_id: sessionId,
@@ -44,6 +44,7 @@ export function sessionStart(sessionId: string, catalogRevision: string, modelId
     encoding: "pcm_s16le" as const,
     catalog_revision: catalogRevision,
     model_id: modelId,
+    connection_ticket: connectionTicket,
   };
 }
 

@@ -11,6 +11,7 @@ async function probeRunPodService(config: AppConfig, fetcher: typeof fetch): Pro
   try {
     const response = await fetcher(`${config.serviceUrl}${config.readyPath}`, {
       cache: "no-store",
+      redirect: "error",
       signal: AbortSignal.timeout(3500),
     });
     let health: Record<string, unknown> | undefined;
@@ -31,6 +32,7 @@ export class LiveRunPodProvider implements PodProvider {
     const response = await this.fetcher(`${this.config.apiBase}${path}`, {
       ...init,
       headers: { Authorization: `Bearer ${this.config.apiKey}`, ...init?.headers },
+      redirect: "error",
       signal: AbortSignal.timeout(10_000),
     });
     if (!response.ok) {
@@ -63,7 +65,11 @@ export class ReadonlyRunPodProvider implements PodProvider {
   constructor(private config: AppConfig, private fetcher: typeof fetch = fetch) {}
 
   async getPod(): Promise<PodInfo> {
-    return { id: this.config.podId, name: "qwen3asr-finetuning-migration-migration", desiredStatus: "EXITED" };
+    return {
+      id: this.config.podId,
+      name: this.config.workers[0]?.name ?? "configured Qwen worker",
+      desiredStatus: "EXITED",
+    };
   }
 
   async startPod(): Promise<void> {
@@ -119,8 +125,9 @@ export class MockRunPodProvider implements PodProvider {
       status: ready ? 200 : 503,
       message: ready ? undefined : "モデルをGPUへロードしています",
       health: ready ? {
+        worker_id: this.config.workers[0]?.id || this.config.podId,
+        model_id: this.config.workers[0]?.modelId,
         accelerator: "RunPod A100 80GB",
-        model: "qwen3-asr-ja-rlbr-context-fullft",
         backend: "qwen_async_vllm",
         catalog_revision: "securities-terms-93b1402b7a39",
         catalog_terms: 248,

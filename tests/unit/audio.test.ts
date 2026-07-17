@@ -3,13 +3,14 @@ import { appendPcmSamples, downsample, floatToPcm, sessionStart } from "../../sr
 
 describe("realtime audio contract", () => {
   it("creates the exact session.start contract", () => {
-    expect(sessionStart("session-1", "catalog-1", "infodeliverailab/context")).toEqual({
+    expect(sessionStart("session-1", "catalog-1", "infodeliverailab/context", "worker-ticket-1")).toEqual({
       type: "session.start",
       session_id: "session-1",
       sample_rate: 16000,
       encoding: "pcm_s16le",
       catalog_revision: "catalog-1",
       model_id: "infodeliverailab/context",
+      connection_ticket: "worker-ticket-1",
     });
   });
 

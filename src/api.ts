@@ -1,6 +1,8 @@
 import type {
   AsrModelCatalog,
+  AssignmentPurpose,
   ControlStatus,
+  InferenceAssignment,
   PersistUtteranceInput,
   TranscriptSource,
   TranscriptUtterance,
@@ -82,6 +84,19 @@ export const api = {
     method: "POST",
     body: JSON.stringify(input),
   }),
+  requestAssignment: (id: string, purpose: AssignmentPurpose, signal?: AbortSignal) =>
+    request<InferenceAssignment>(`/api/transcriptions/${encodeURIComponent(id)}/assignment`, {
+      method: "POST",
+      body: JSON.stringify({ purpose }),
+      signal,
+    }),
+  assignment: (id: string, signal?: AbortSignal) =>
+    request<InferenceAssignment>(`/api/transcriptions/${encodeURIComponent(id)}/assignment`, { signal }),
+  heartbeatAssignment: (id: string, signal?: AbortSignal) =>
+    request<{ status: "active"; lease_expires_at: string }>(
+      `/api/transcriptions/${encodeURIComponent(id)}/assignment/heartbeat`,
+      { method: "POST", body: "{}", signal },
+    ),
   transcription: (id: string) => request<TranscriptionDetail>(`/api/transcriptions/${encodeURIComponent(id)}`),
   renameTranscription: (id: string, title: string) => request<TranscriptionSession>(`/api/transcriptions/${encodeURIComponent(id)}`, {
     method: "PATCH",
