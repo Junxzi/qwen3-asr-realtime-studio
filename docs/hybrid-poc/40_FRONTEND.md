@@ -25,3 +25,11 @@
 - finalizer 完了だけで置換完了にせず、authoritative final 受信を待つ。
 - PUT 成功だけで保存完了にする。outbox 格納時は保存待ちにする。
 - 履歴画面では静的構成図と「実行イベントは保存されていません」を表示する。
+
+## Visual QA
+
+主要状態は実アプリのproduction buildを使い、desktopとmobileで確認する。
+
+![Hybrid pipeline diagnostics](screenshots/studio-hybrid-desktop.jpg)
+
+![Mobile workspace](screenshots/studio-mobile.png)
