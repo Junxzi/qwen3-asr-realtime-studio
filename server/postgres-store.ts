@@ -49,7 +49,9 @@ function mapSession(row: SessionRow, utteranceCount = 0): TranscriptionSession {
     title_customized: row.titleCustomized,
     status: row.status as TranscriptionSession["status"],
     source: row.source as TranscriptionSession["source"],
+    processing_mode: row.processingMode as TranscriptionSession["processing_mode"],
     model_id: row.modelId,
+    final_model_id: row.finalModelId,
     catalog_revision: row.catalogRevision,
     started_at: row.startedAt.toISOString(),
     ended_at: toIso(row.endedAt),
@@ -74,6 +76,7 @@ function mapUtterance(row: UtteranceRow): TranscriptUtterance {
     text: row.text,
     words: row.words,
     context_hits: row.contextHits,
+    audio_start_ms: row.audioStartMs,
     audio_end_ms: row.audioEndMs,
     latency_ms: row.latencyMs,
     queue_ms: row.queueMs,
@@ -173,7 +176,9 @@ export class PostgresTranscriptionStore implements TranscriptionStore {
         titleCustomized: false,
         status: "recording",
         source: input.source,
+        processingMode: input.processingMode,
         modelId: input.modelId,
+        finalModelId: input.finalModelId,
         catalogRevision: input.catalogRevision,
         startedAt: input.now,
         endedAt: null,
@@ -260,6 +265,7 @@ export class PostgresTranscriptionStore implements TranscriptionStore {
           text: input.text,
           words: input.words,
           contextHits: input.contextHits,
+          audioStartMs: input.audioStartMs ?? 0,
           audioEndMs: input.audioEndMs,
           latencyMs: input.latencyMs,
           queueMs: input.queueMs,
@@ -390,6 +396,7 @@ export class PostgresTranscriptionStore implements TranscriptionStore {
         .set({ status: "interrupted", endedAt: now, updatedAt: now })
         .where(and(
           eq(transcriptionSessions.status, "recording"),
+          gt(transcriptionSessions.expiresAt, now),
           lt(transcriptionSessions.lastActivityAt, threshold),
         ))
         .returning({ id: transcriptionSessions.id });

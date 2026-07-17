@@ -79,7 +79,8 @@ class _NeMoStreamState:
 class NeMoSortformerDiarizer:
     """Streaming-Sortformer adapter with arrival-order labels capped at two speakers.
 
-    Each utterance keeps the official NeMo StreamingSortformerState (AOSC + FIFO).
+    Each logical call stream keeps the official NeMo StreamingSortformerState
+    (AOSC + FIFO), so arrival-order speaker labels survive VAD utterance resets.
     Only newly arrived audio is preprocessed and forwarded, so inference cost is
     linear in stream duration rather than repeatedly reprocessing the full prefix.
     """

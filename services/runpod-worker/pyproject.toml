@@ -19,12 +19,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+batch = [
+  "python-multipart>=0.0.18,<1",
+]
 gpu = [
   "qwen-asr==0.0.6",
+  "speechbrain==1.1.0",
   "vllm[audio]==0.14.0",
   "silero-vad==6.2.1",
 ]
 dev = [
+  "python-multipart>=0.0.18,<1",
   "pytest>=8.3,<9",
   "pytest-asyncio>=0.25,<1",
   "ruff>=0.9,<1",
@@ -35,6 +40,7 @@ dev = [
 
 [project.scripts]
 qwen-realtime = "qwen_realtime.app:main"
+qwen-lab-batch = "qwen_realtime.lab_batch:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/qwen_realtime"]

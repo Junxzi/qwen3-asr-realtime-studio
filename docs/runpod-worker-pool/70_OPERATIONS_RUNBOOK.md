@@ -1,5 +1,56 @@
 # RunPod worker pool operations runbook
 
+## lab batch workerのcold/warm起動
+
+`lab_asr_diarization_v1`はContext realtimeと同じproduction imageを使い、Templateの
+`WORKER_RUNTIME=batch`でbatch経路を選ぶ。batchの依存はimage内の共有
+`/opt/venvs/asr`から実行し、private code、model weight、HF tokenをimage layerへ
+含めない。TemplateとRailwayのmodel template mapは`max_sessions=1`に揃える。
+
+起動前に次を確認する。
+
+1. PodへNetwork Volumeを`/workspace`としてmountする。
+2. `MODEL_ID=infodeliverailab/lab_asr_diarization_v1`、`WORKER_RUNTIME=batch`、
+   `LAB_PYTHON=/opt/venvs/asr/bin/python`を設定する。
+3. `HF_TOKEN`はprivate lab repoを読めるRunPod Secret、`WORKER_TICKET_SECRET`と
+   `WORKER_ADMIN_SECRET`は制御プレーンと対応する独立secretから注入する。
+4. `LAB_ALLOWED_ORIGINS`へStudioの公開originをscheme、host、portまで完全一致で
+   設定する。複数はcomma区切りとし、wildcard `*`は使わない。
+5. Templateは検証対象のproduction image digestへ固定し、tagやrepoの`main`を追従しない。
+
+`run_all.sh`はbootstrap health serviceを起動した後、`bootstrap_lab_batch.py`で次の
+snapshotだけを`/workspace/lab-asr-poc`へ配置する。
+
+| Snapshot | revision |
+| --- | --- |
+| `infodeliverailab/lab_asr_diarization_v1` | `651c6d0f303557332293afa9fa15e1dd30456606` |
+| `Qwen/Qwen3-ASR-1.7B` | `b188e100bd85038c06d2812d24a39776eba774ca` |
+| `speechbrain/spkrec-ecapa-voxceleb` | `0f99f2d0ebe89ac095bcc5903c4dd8f72b367286` |
+
+downloadは`.lab-batch-download.lock`の`flock`で直列化する。全配置の完了後に
+`.lab-batch-models.json`をatomicに置換するため、途中終了したdownloadをwarm配置と
+誤認しない。次回起動でmanifestが期待値と完全一致し、3 directoryが存在するときは
+downloadを行わない。manifest欠落、revision変更、directory欠落時は固定snapshotを
+再配置する。Volumeをprewarmするときは同時に複数Podを起動せず、まず1 Podのbootstrap
+完了を待つ。
+
+cold download中は`/health`が200、`/ready?model_id=infodeliverailab%2Flab_asr_diarization_v1`
+が503であることを確認する。model load完了後は`/ready`が200、`worker_id`と`model_id`が
+登録値に一致し、`max_sessions`が1であることを確認する。二回目のwarm起動ではbootstrap
+出力の`downloaded=false`を確認し、HF downloadが再発していないことをログで確認する。
+
+代表的な失敗確認順は次のとおり。
+
+1. `HF_TOKEN is required`または401/403: RunPod Secretの参照名とorganization/repo read権限。
+2. `snapshot placement is incomplete or revision-mismatched`: manifestと3 directoryの有無。手動でrevisionを書き換えず、固定bootstrapを再実行する。
+3. import error: `LAB_PYTHON`が`/opt/venvs/asr/bin/python`で、image digestがbatch依存を含む版か。
+4. CORS拒否: browserの`Origin`と`LAB_ALLOWED_ORIGINS`の完全一致。末尾slashを追加しない。
+5. `/ready` 503: `load_failed`、`security_configured`、`worker_id`、GPU telemetryを`/healthz`で確認する。
+
+adapter、自動bootstrap、CPUテストが成功していても実GPU検証の代わりにはならない。
+固定image digest、上記3 revision、実音声fixture、応答JSON、VRAM、RTFを記録するまでは
+Studioの`validated=false` / `実GPU検証待ち`を解除しない。
+
 ## Provisioning deadline
 
 - `WORKER_PROVISION_TIMEOUT_SECONDS`（既定300秒）を超えてもPod IDが確定しないdynamic worker placeholderは、reaperが`enabled=false`、`status=terminated`へ移す。

@@ -36,6 +36,70 @@ export function floatToPcm(samples: Float32Array) {
   return pcm.buffer;
 }
 
+export class PcmTimelineBuffer {
+  private chunks: Int16Array[] = [];
+  private sampleCount = 0;
+
+  append(buffer: ArrayBuffer) {
+    const chunk = new Int16Array(buffer.slice(0));
+    if (!chunk.length) return;
+    this.chunks.push(chunk);
+    this.sampleCount += chunk.length;
+  }
+
+  clear() {
+    this.chunks = [];
+    this.sampleCount = 0;
+  }
+
+  slice(startMs: number, endMs: number, sampleRate = SAMPLE_RATE) {
+    const startSample = Math.max(0, Math.floor(startMs * sampleRate / 1000));
+    const endSample = Math.min(this.sampleCount, Math.ceil(endMs * sampleRate / 1000));
+    if (endSample <= startSample) throw new Error("発話音声の範囲を取得できませんでした");
+    const output = new Int16Array(endSample - startSample);
+    let timelineOffset = 0;
+    let outputOffset = 0;
+    for (const chunk of this.chunks) {
+      const chunkEnd = timelineOffset + chunk.length;
+      if (chunkEnd > startSample && timelineOffset < endSample) {
+        const localStart = Math.max(0, startSample - timelineOffset);
+        const localEnd = Math.min(chunk.length, endSample - timelineOffset);
+        const portion = chunk.subarray(localStart, localEnd);
+        output.set(portion, outputOffset);
+        outputOffset += portion.length;
+      }
+      timelineOffset = chunkEnd;
+      if (timelineOffset >= endSample) break;
+    }
+    return output;
+  }
+}
+
+export function pcmS16leToWav(samples: Int16Array, sampleRate = SAMPLE_RATE) {
+  const headerBytes = 44;
+  const bytesPerSample = 2;
+  const buffer = new ArrayBuffer(headerBytes + samples.length * bytesPerSample);
+  const view = new DataView(buffer);
+  const writeAscii = (offset: number, value: string) => {
+    for (let index = 0; index < value.length; index += 1) view.setUint8(offset + index, value.charCodeAt(index));
+  };
+  writeAscii(0, "RIFF");
+  view.setUint32(4, buffer.byteLength - 8, true);
+  writeAscii(8, "WAVE");
+  writeAscii(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * bytesPerSample, true);
+  view.setUint16(32, bytesPerSample, true);
+  view.setUint16(34, 16, true);
+  writeAscii(36, "data");
+  view.setUint32(40, samples.length * bytesPerSample, true);
+  new Int16Array(buffer, headerBytes).set(samples);
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
 export function sessionStart(sessionId: string, catalogRevision: string, modelId: string, connectionTicket: string) {
   return {
     type: "session.start" as const,

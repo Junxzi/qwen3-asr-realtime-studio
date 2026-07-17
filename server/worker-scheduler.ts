@@ -1,4 +1,4 @@
-import type { AppConfig } from "./config.js";
+import { modelTemplateRequiresNetworkVolume, type AppConfig } from "./config.js";
 import { ProviderError } from "./runpod.js";
 import type { PodInfo, PodProvider, AssignmentRecord, WorkerRecord, WorkerRuntime } from "./types.js";
 import {
@@ -18,7 +18,7 @@ export interface AssignmentResponse {
   status: AssignmentRecord["status"];
   worker?: ReturnType<typeof workerSummary>;
   connection?: {
-    websocket_url: string;
+    websocket_url?: string;
     batch_url?: string;
     ticket: string;
     expires_at: string;
@@ -74,7 +74,7 @@ export class WorkerScheduler {
       ?? await this.store.getWorker(worker.id);
   }
 
-  private async reconcileWorker(worker: WorkerRecord) {
+  private async reconcileWorkerStatus(worker: WorkerRecord) {
     const current = await this.store.getWorker(worker.id);
     if (!current || !current.enabled) return current;
     if (current.origin === "dynamic" && !current.podId && current.status === "starting") {
@@ -150,6 +150,36 @@ export class WorkerScheduler {
     }, checkedAt);
   }
 
+  private async reconcileWorker(worker: WorkerRecord) {
+    let observed = await this.reconcileWorkerStatus(worker);
+    if (!observed) {
+      observed = await this.store.updateWorker(worker.id, {
+        enabled: false,
+        status: "unhealthy",
+        health: { message: "worker disappeared during reconciliation" },
+      }, new Date(this.now()));
+    }
+    const workerIsLost = !observed || !observed.enabled || observed.status !== "ready";
+    if (workerIsLost) {
+      const requeued = await this.store.requeueAssignmentsForWorker(
+        worker.id,
+        new Date(this.now()),
+        this.config.workerLeaseSeconds,
+        "割当済みGPUワーカーとの接続が失われたため再割当を待っています",
+      );
+      if (requeued.length > 0) {
+        console.warn(JSON.stringify({
+          level: "warn",
+          event: "worker_assignments_requeued",
+          workerId: worker.id,
+          assignmentIds: requeued.map((assignment) => assignment.id),
+          sessionIds: [...new Set(requeued.map((assignment) => assignment.sessionId))],
+        }));
+      }
+    }
+    return observed;
+  }
+
   async reconcile() {
     await this.ensureInitialized();
     if (this.reconcilePromise) return this.reconcilePromise;
@@ -202,6 +232,24 @@ export class WorkerScheduler {
     }));
   }
 
+  private async markProvisioning(
+    assignmentId: string,
+    workerId: string | null,
+    message: string,
+  ) {
+    const assignment = await this.store.markProvisioning(
+      assignmentId,
+      workerId,
+      message,
+      new Date(this.now()),
+      this.config.workerLeaseSeconds,
+    );
+    if (workerId && ["released", "failed"].includes(assignment.status)) {
+      await this.stopDynamicWorkerIfIdle(workerId);
+    }
+    return assignment;
+  }
+
   private async findAndRegisterProvisionedWorker(worker: WorkerRecord) {
     if (worker.origin !== "dynamic" || worker.podId || worker.status !== "starting") return null;
     const pod = await this.fleet.findPodByWorkerId(worker.id);
@@ -239,24 +287,20 @@ export class WorkerScheduler {
     message: string,
   ) {
     const dynamicWorker = await this.registerProvisionedWorker(workerId, pod);
-    return await this.store.markProvisioning(
+    return await this.markProvisioning(
       assignment.id,
       dynamicWorker.id,
       message,
-      new Date(this.now()),
-      this.config.workerLeaseSeconds,
     );
   }
 
   private async adoptProvisionedPod(assignment: AssignmentRecord, worker: WorkerRecord) {
     const dynamicWorker = await this.findAndRegisterProvisionedWorker(worker);
     if (!dynamicWorker) return null;
-    return await this.store.markProvisioning(
+    return await this.markProvisioning(
       assignment.id,
       dynamicWorker.id,
       "既存のRunPod GPUワーカーを復旧しています",
-      new Date(this.now()),
-      this.config.workerLeaseSeconds,
     );
   }
 
@@ -276,6 +320,7 @@ export class WorkerScheduler {
   }
 
   private async stopDynamicWorkerIfIdle(workerId: string) {
+    if (!this.config.autoStopIdleWorkers) return;
     if (!this.fleet.canMutate) return;
     const worker = await this.store.getWorker(workerId);
     if (
@@ -307,16 +352,29 @@ export class WorkerScheduler {
 
   private async progress(initial: AssignmentRecord): Promise<AssignmentRecord> {
     if (["released", "failed"].includes(initial.status)) return initial;
-    if (initial.status === "active") return initial;
-    if (initial.status === "ready") {
+    if (initial.status === "ready" || initial.status === "active") {
       const worker = initial.workerId ? await this.store.getWorker(initial.workerId) : null;
       const observed = worker ? await this.reconcileWorker(worker) : null;
-      if (observed?.enabled && observed.status === "ready" && observed.modelId === initial.modelId) return initial;
-      await this.store.release(initial.sessionId, new Date(this.now()));
-      return await this.store.markFailed(initial.id, "割り当て済みGPUワーカーが利用できなくなりました", new Date(this.now()));
+      if (
+        observed?.enabled
+        && observed.status === "ready"
+        && observed.modelId === initial.modelId
+        && observed.runtime === initial.purpose
+      ) return initial;
+      const requeued = await this.store.getAssignmentBySession(initial.sessionId, initial.purpose);
+      if (requeued && (requeued.status === "requested" || requeued.status === "provisioning")) {
+        return await this.progress(requeued);
+      }
+      if (requeued) return requeued;
+      await this.store.releaseAssignment(initial.id, new Date(this.now()));
+      return await this.store.markFailed(
+        initial.id,
+        "割当済みGPUワーカーが見つからないため再割当できませんでした",
+        new Date(this.now()),
+      );
     }
     let assignment = await this.reserve(initial);
-    if (assignment.status === "ready") return assignment;
+    if (["ready", "released", "failed"].includes(assignment.status)) return assignment;
 
     if (assignment.workerId) {
       const assignedWorker = await this.store.getWorker(assignment.workerId);
@@ -325,26 +383,23 @@ export class WorkerScheduler {
         if (adopted) return adopted;
         let observed = await this.reconcileWorker(assignedWorker);
         assignment = await this.reserve(assignment);
-        if (assignment.status === "ready") return assignment;
+        if (["ready", "released", "failed"].includes(assignment.status)) return assignment;
         if (observed?.status === "stopped" && observed.podId && this.fleet.canMutate) {
           observed = await this.startStoppedWorker(observed);
         }
         if (observed?.status !== "terminated") {
-          return await this.store.markProvisioning(
+          return await this.markProvisioning(
             assignment.id,
             assignedWorker.id,
             observed?.status === "loading" ? "モデルをGPUへロードしています" : "GPUワーカーを起動しています",
-            new Date(this.now()),
-            this.config.workerLeaseSeconds,
           );
         }
-        assignment = await this.store.markProvisioning(
+        assignment = await this.markProvisioning(
           assignment.id,
           null,
           "終了したGPUワーカーの代替を探しています",
-          new Date(this.now()),
-          this.config.workerLeaseSeconds,
         );
+        if (["released", "failed"].includes(assignment.status)) return assignment;
       }
     }
 
@@ -355,11 +410,15 @@ export class WorkerScheduler {
       .map((worker) => this.reconcileWorker(worker))))
       .filter((worker): worker is WorkerRecord => Boolean(worker));
     assignment = await this.reserve(assignment);
-    if (assignment.status === "ready") return assignment;
+    if (["ready", "released", "failed"].includes(assignment.status)) return assignment;
     for (const observed of observedCompatible) {
       if (observed?.status === "stopped" && observed.podId && this.fleet.canMutate) {
         const starting = await this.startStoppedWorker(observed);
         assignment = await this.reserve(assignment);
+        if (["released", "failed"].includes(assignment.status)) {
+          if (starting) await this.stopDynamicWorkerIfIdle(starting.id);
+          return assignment;
+        }
         if (assignment.status === "ready") return assignment;
         if (
           starting?.enabled
@@ -367,22 +426,18 @@ export class WorkerScheduler {
           && starting.runtime === assignment.purpose
           && ["starting", "loading", "unhealthy", "ready"].includes(starting.status)
         ) {
-          return await this.store.markProvisioning(
+          return await this.markProvisioning(
             assignment.id,
             starting.id,
             "GPUワーカーを起動しています",
-            new Date(this.now()),
-            this.config.workerLeaseSeconds,
           );
         }
       }
-      if (observed.status === "starting" || observed.status === "loading" || observed.status === "unhealthy") {
-        return await this.store.markProvisioning(
+      if (observed.status === "starting" || observed.status === "loading") {
+        return await this.markProvisioning(
           assignment.id,
           observed.id,
           observed.status === "loading" ? "モデルをGPUへロードしています" : "GPUワーカーの準備を待っています",
-          new Date(this.now()),
-          this.config.workerLeaseSeconds,
         );
       }
     }
@@ -394,6 +449,17 @@ export class WorkerScheduler {
       const profile = this.config.modelTemplates.find((candidate) => (
         candidate.modelId === assignment.modelId && candidate.runtime === assignment.purpose
       ));
+      if (
+        profile
+        && modelTemplateRequiresNetworkVolume(profile)
+        && !this.config.runpodNetworkVolumeId
+      ) {
+        throw new ProviderError(
+          "runpod_network_volume_required",
+          "RUNPOD_NETWORK_VOLUME_ID is required before this worker template can be provisioned",
+          503,
+        );
+      }
       const workerId = `provision-${assignment.id}`;
       const claim = await this.store.claimProvisioningWorker({
         id: workerId,
@@ -411,13 +477,19 @@ export class WorkerScheduler {
         // request can succeed remotely while its response is lost, so the
         // placeholder must remain discoverable (and non-reusable) until the
         // provisioning deadline.
-        await this.store.markProvisioning(
+        const binding = await this.markProvisioning(
           assignment.id,
           claimed.id,
           "RunPod GPU worker provisioning is in progress",
-          new Date(this.now()),
-          this.config.workerLeaseSeconds,
         );
+        if (["released", "failed"].includes(binding.status)) {
+          await this.store.updateWorkerIfStatus(claimed.id, "starting", {
+            enabled: false,
+            status: "terminated",
+            health: { message: "GPU worker provisioning was cancelled before Pod creation" },
+          }, new Date(this.now()));
+          return binding;
+        }
         let createdPodId: string | null = null;
         let createAttempted = false;
         try {
@@ -516,12 +588,10 @@ export class WorkerScheduler {
       } else if (claim) {
         const adopted = await this.adoptProvisionedPod(assignment, claim.worker);
         if (adopted) return adopted;
-        return await this.store.markProvisioning(
+        return await this.markProvisioning(
           assignment.id,
           claim.worker.id,
           "新しいGPUワーカーを作成しています",
-          new Date(this.now()),
-          this.config.workerLeaseSeconds,
         );
       } else {
         const inFlight = await this.store.getWorker(workerId);
@@ -534,12 +604,10 @@ export class WorkerScheduler {
         ) {
           const adopted = await this.adoptProvisionedPod(assignment, inFlight);
           if (adopted) return adopted;
-          return await this.store.markProvisioning(
+          return await this.markProvisioning(
             assignment.id,
             inFlight.id,
             "新しいGPUワーカーを作成しています",
-            new Date(this.now()),
-            this.config.workerLeaseSeconds,
           );
         }
       }
@@ -557,42 +625,57 @@ export class WorkerScheduler {
         || worker.modelId !== assignment.modelId
       ));
     if (atHardCapacity) throw new ProviderError("capacity_exceeded", "利用可能なGPUワーカー容量がありません", 429);
-    return await this.store.markProvisioning(
+    return await this.markProvisioning(
       assignment.id,
       null,
       this.fleet.canMutate ? "利用可能なGPUワーカーを待っています" : "RunPod GPUの手動起動を待っています",
-      new Date(this.now()),
-      this.config.workerLeaseSeconds,
     );
   }
 
   async request(input: { sessionId: string; modelId: string; purpose: WorkerRuntime }) {
     await this.ensureInitialized();
-    const existing = await this.store.getAssignmentBySession(input.sessionId);
-    if (existing) return await this.progress(existing);
     const assignment = await this.store.createRequestedAssignment({
       ...input,
       now: new Date(this.now()),
       leaseSeconds: this.config.workerLeaseSeconds,
     });
+    if (assignment.modelId !== input.modelId) {
+      throw new ProviderError(
+        "assignment_model_mismatch",
+        "同じ処理方式に別のモデルを再割り当てすることはできません",
+        409,
+      );
+    }
     return await this.progress(assignment);
   }
 
-  async observe(sessionId: string) {
-    await this.ensureInitialized();
-    return await this.store.getAssignmentBySession(sessionId);
+  canProvisionWorkers() {
+    return this.fleet.canMutate;
   }
 
-  async touch(sessionId: string) {
+  async observe(sessionId: string, purpose?: WorkerRuntime) {
     await this.ensureInitialized();
-    return await this.store.touch(sessionId, new Date(this.now()), this.config.workerLeaseSeconds);
+    return await this.store.getAssignmentBySession(sessionId, purpose);
+  }
+
+  async observeAll(sessionId: string) {
+    await this.ensureInitialized();
+    return await this.store.listAssignmentsBySession(sessionId);
+  }
+
+  async touch(sessionId: string, purpose?: WorkerRuntime) {
+    await this.ensureInitialized();
+    return await this.store.touch(sessionId, new Date(this.now()), this.config.workerLeaseSeconds, purpose);
   }
 
   async release(sessionId: string) {
     await this.ensureInitialized();
-    const before = await this.store.getAssignmentBySession(sessionId);
+    const before = await this.store.listAssignmentsBySession(sessionId);
     const released = await this.store.release(sessionId, new Date(this.now()));
-    if (before?.workerId) await this.stopDynamicWorkerIfIdle(before.workerId);
+    const workerIds = [...new Set(
+      [...before, ...released].flatMap((assignment) => assignment.workerId ? [assignment.workerId] : []),
+    )];
+    await Promise.all(workerIds.map((workerId) => this.stopDynamicWorkerIfIdle(workerId)));
     return released;
   }
 
@@ -626,13 +709,15 @@ export class WorkerScheduler {
     await this.ensureInitialized();
     const workers = await this.store.listWorkers();
     const ready = workers.filter((worker) => worker.enabled && worker.status === "ready").length;
-    const activeSessions = workers.reduce((total, worker) => total + worker.activeSessions, 0);
+    const activeAssignments = workers.reduce((total, worker) => total + worker.activeSessions, 0);
+    const activeSessions = await this.store.countActiveSessions(["ready", "active"]);
     const capacity = workers.filter((worker) => worker.enabled).reduce((total, worker) => total + worker.maxSessions, 0);
     const provisioningAssignments = await this.store.countAssignments(["requested", "provisioning"]);
     return {
       total_workers: workers.length,
       ready_workers: ready,
       active_sessions: activeSessions,
+      active_assignments: activeAssignments,
       capacity,
       provisioning_assignments: provisioningAssignments,
       workers: workers.map(workerSummary),
@@ -641,6 +726,7 @@ export class WorkerScheduler {
         enabled: workers.filter((worker) => worker.enabled).length,
         ready,
         active_sessions: activeSessions,
+        active_assignments: activeAssignments,
         capacity,
         provisioning_assignments: provisioningAssignments,
       },
@@ -726,6 +812,7 @@ export class WorkerScheduler {
       && worker.enabled
       && worker.status === "ready"
       && worker.modelId === assignment.modelId
+      && worker.runtime === assignment.purpose
       && (assignment.status === "ready" || assignment.status === "active")
     ) {
       const issued = createWorkerTicket({
@@ -738,10 +825,12 @@ export class WorkerScheduler {
         ttlSeconds: this.config.workerTicketTtlSeconds,
       });
       response.connection = {
-        websocket_url: `${worker.serviceUrl.replace(/^http/, "ws")}/v1/realtime`,
+        ...(assignment.purpose === "realtime"
+          ? { websocket_url: `${worker.serviceUrl.replace(/^http/, "ws")}/v1/realtime` }
+          : { batch_url: `${worker.serviceUrl}/v1/audio/transcriptions` }),
         ticket: issued.token,
         expires_at: new Date(issued.claims.exp * 1000).toISOString(),
-        catalog_revision: typeof worker.health?.catalog_revision === "string"
+        catalog_revision: assignment.purpose === "realtime" && typeof worker.health?.catalog_revision === "string"
           ? worker.health.catalog_revision
           : null,
       };

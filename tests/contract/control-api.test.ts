@@ -168,9 +168,100 @@ describe("control API", () => {
         integration_status: "adapter_required",
       }),
       expect.objectContaining({ id: "infodeliverailab/lab_asr_jp_1", selectable: false }),
-      expect.objectContaining({ id: "infodeliverailab/lab_asr_diarization_v1", selectable: false }),
+      expect.objectContaining({
+        id: "infodeliverailab/lab_asr_diarization_v1",
+        runtime: "batch",
+        selectable: true,
+        integration_status: "gpu_validation_required",
+      }),
       expect.objectContaining({ id: "infodeliverailab/lab_asr_diarization_v2", selectable: false }),
     ]));
+    expect(response.body.data.default_processing_mode).toBe("realtime");
+    expect(response.body.data.processing_modes.map((profile: { id: string }) => profile.id))
+      .toEqual(["realtime", "batch", "hybrid"]);
+    expect(response.body.data.processing_modes.find((profile: { id: string }) => profile.id === "batch"))
+      .toMatchObject({
+        input_modes: ["file"],
+        primary_model_id: "infodeliverailab/lab_asr_diarization_v1",
+        final_model_id: null,
+        assignments: [{ purpose: "batch", model_id: "infodeliverailab/lab_asr_diarization_v1" }],
+        availability: {
+          selectable: true,
+          configured: false,
+          provisionable: false,
+          validated: false,
+          status: "setup_required",
+        },
+      });
+    expect(response.body.data.processing_modes.find((profile: { id: string }) => profile.id === "realtime"))
+      .toMatchObject({
+        availability: {
+          selectable: true,
+          configured: true,
+          provisionable: true,
+          validated: true,
+          status: "configured",
+        },
+      });
+    const hybrid = response.body.data.processing_modes.find((profile: { id: string }) => profile.id === "hybrid");
+    expect(hybrid.nodes.map((node: { id: string }) => node.id)).toEqual([
+      "audio_ingest",
+      "context_asr",
+      "streaming_sortformer",
+      "vad",
+      "endpoint",
+      "lab_finalizer",
+      "replace_result",
+      "persist",
+    ]);
+    expect(hybrid.edges).toContainEqual({ from: "endpoint", to: "lab_finalizer" });
+  });
+
+  it("creates backward-compatible realtime, file-only batch, and fixed hybrid sessions", async () => {
+    const agent = request.agent(app);
+    await agent.post("/api/session/login").set("origin", "http://localhost").send({ password: "test-password" }).expect(200);
+
+    const realtime = await agent.post("/api/transcriptions").set("origin", "http://localhost").send({
+      source: "microphone",
+      model_id: "infodeliverailab/qwen3-asr-ja-rlbr-context-fullft",
+      final_model_id: null,
+    }).expect(201);
+    expect(realtime.body.data).toMatchObject({
+      processing_mode: "realtime",
+      model_id: "infodeliverailab/qwen3-asr-ja-rlbr-context-fullft",
+      final_model_id: null,
+    });
+
+    await agent.post("/api/transcriptions").set("origin", "http://localhost").send({
+      source: "microphone",
+      processing_mode: "batch",
+    }).expect(400);
+
+    const batch = await agent.post("/api/transcriptions").set("origin", "http://localhost").send({
+      source: "file",
+      processing_mode: "batch",
+    }).expect(201);
+    expect(batch.body.data).toMatchObject({
+      processing_mode: "batch",
+      model_id: "infodeliverailab/lab_asr_diarization_v1",
+      final_model_id: null,
+    });
+
+    const hybrid = await agent.post("/api/transcriptions").set("origin", "http://localhost").send({
+      source: "microphone",
+      processing_mode: "hybrid",
+    }).expect(201);
+    expect(hybrid.body.data).toMatchObject({
+      processing_mode: "hybrid",
+      model_id: "infodeliverailab/qwen3-asr-ja-rlbr-context-fullft",
+      final_model_id: "infodeliverailab/lab_asr_diarization_v1",
+    });
+
+    await agent.post("/api/transcriptions").set("origin", "http://localhost").send({
+      source: "file",
+      processing_mode: "hybrid",
+      model_id: "infodeliverailab/lab_asr_diarization_v1",
+    }).expect(400);
   });
 
   it("rejects model ids outside the curated ASR catalog", async () => {
@@ -199,7 +290,11 @@ describe("control API", () => {
       catalog_revision: "catalog-1",
     }).expect(201);
     const id = created.body.data.id as string;
-    expect(created.body.data.status).toBe("recording");
+    expect(created.body.data).toMatchObject({
+      status: "recording",
+      processing_mode: "realtime",
+      final_model_id: null,
+    });
     expect(created.body.data.expires_at).toBe(new Date(clock + 30 * 86_400_000).toISOString());
 
     const finalPayload = {
@@ -210,6 +305,7 @@ describe("control API", () => {
         { text: "の佐藤です", start_ms: 720, end_ms: 1300, speaker: "speaker_1", confidence: 0.97 },
       ],
       context_hits: ["あかつき証券"],
+      audio_start_ms: 100,
       audio_end_ms: 1300,
       latency_ms: 820,
       queue_ms: 120,
@@ -233,6 +329,7 @@ describe("control API", () => {
     expect(detail.body.data.utterances).toHaveLength(1);
     expect(detail.body.data.utterances[0].revision).toBe(4);
     expect(detail.body.data.utterances[0].text).toBe("あかつき証券の佐藤でございます。");
+    expect(detail.body.data.utterances[0].audio_start_ms).toBe(100);
 
     const search = await agent.get("/api/transcriptions").query({ q: "あかつき", limit: 10 }).expect(200);
     expect(search.body.data).toHaveLength(1);

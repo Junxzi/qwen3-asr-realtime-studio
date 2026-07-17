@@ -3,7 +3,12 @@ import { and, asc, eq, inArray, lt, notInArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import type { AppConfig } from "./config.js";
-import { inferenceWorkers, transcriptionAssignments } from "./schema.js";
+import {
+  inferenceWorkers,
+  legacyTranscriptionAssignments,
+  transcriptionAssignments,
+  transcriptionSessions,
+} from "./schema.js";
 import { StoreError } from "./transcriptions.js";
 import type {
   AssignmentRecord,
@@ -41,6 +46,7 @@ export interface WorkerPoolStore {
   listWorkers(): Promise<WorkerRecord[]>;
   getWorker(id: string): Promise<WorkerRecord | null>;
   countAssignments(statuses: AssignmentStatus[]): Promise<number>;
+  countActiveSessions(statuses: AssignmentStatus[]): Promise<number>;
   countAssignmentsForWorker(workerId: string, statuses: AssignmentStatus[]): Promise<number>;
   upsertWorker(worker: KnownWorkerConfig, status: WorkerStatus, now: Date): Promise<WorkerRecord>;
   claimProvisioningWorker(
@@ -70,12 +76,20 @@ export interface WorkerPoolStore {
     now: Date;
     leaseSeconds: number;
   }): Promise<AssignmentRecord>;
-  getAssignmentBySession(sessionId: string): Promise<AssignmentRecord | null>;
+  getAssignmentBySession(sessionId: string, purpose?: WorkerRuntime): Promise<AssignmentRecord | null>;
+  listAssignmentsBySession(sessionId: string): Promise<AssignmentRecord[]>;
   reserveReadyWorker(assignmentId: string, now: Date, leaseSeconds: number): Promise<AssignmentRecord>;
   markProvisioning(assignmentId: string, workerId: string | null, message: string, now: Date, leaseSeconds: number): Promise<AssignmentRecord>;
   markFailed(assignmentId: string, message: string, now: Date): Promise<AssignmentRecord>;
-  touch(sessionId: string, now: Date, leaseSeconds: number): Promise<AssignmentRecord | null>;
-  release(sessionId: string, now: Date): Promise<AssignmentRecord | null>;
+  touch(sessionId: string, now: Date, leaseSeconds: number, purpose?: WorkerRuntime): Promise<AssignmentRecord[]>;
+  requeueAssignmentsForWorker(
+    workerId: string,
+    now: Date,
+    leaseSeconds: number,
+    message: string,
+  ): Promise<AssignmentRecord[]>;
+  releaseAssignment(assignmentId: string, now: Date): Promise<AssignmentRecord | null>;
+  release(sessionId: string, now: Date): Promise<AssignmentRecord[]>;
   reapExpired(now: Date): Promise<number>;
   close(): Promise<void>;
 }
@@ -106,11 +120,40 @@ function leaseUntil(now: Date, leaseSeconds: number) {
   return new Date(now.getTime() + leaseSeconds * 1000);
 }
 
+function assignmentKey(sessionId: string, purpose: WorkerRuntime) {
+  return `${sessionId}:${purpose}`;
+}
+
+function sortAssignments(assignments: AssignmentRecord[]) {
+  return assignments.sort((left, right) => (
+    Number(right.purpose === "realtime") - Number(left.purpose === "realtime")
+    || left.createdAt.getTime() - right.createdAt.getTime()
+    || left.id.localeCompare(right.id)
+  ));
+}
+
+export function buildWorkerDecrementPlan(
+  assignments: readonly { workerId: string | null; status: string }[],
+) {
+  const counts = new Map<string, number>();
+  for (const assignment of assignments) {
+    if (
+      !assignment.workerId
+      || (assignment.status !== "ready" && assignment.status !== "active")
+    ) continue;
+    counts.set(assignment.workerId, (counts.get(assignment.workerId) ?? 0) + 1);
+  }
+  return [...counts].map(([workerId, count]) => ({ workerId, count }))
+    .sort((left, right) => (
+      left.workerId < right.workerId ? -1 : Number(left.workerId > right.workerId)
+    ));
+}
+
 export class MemoryWorkerPoolStore implements WorkerPoolStore {
   readonly kind = "memory" as const;
   private workers = new Map<string, WorkerRecord>();
   private assignments = new Map<string, AssignmentRecord>();
-  private assignmentIdBySession = new Map<string, string>();
+  private assignmentIdBySessionPurpose = new Map<string, string>();
 
   private assertPodIdAvailable(podId: string, workerId: string) {
     if (!podId) return;
@@ -182,6 +225,12 @@ export class MemoryWorkerPoolStore implements WorkerPoolStore {
 
   async countAssignments(statuses: AssignmentStatus[]) {
     return [...this.assignments.values()].filter((assignment) => statuses.includes(assignment.status)).length;
+  }
+
+  async countActiveSessions(statuses: AssignmentStatus[]) {
+    return new Set([...this.assignments.values()]
+      .filter((assignment) => statuses.includes(assignment.status))
+      .map((assignment) => assignment.sessionId)).size;
   }
 
   async countAssignmentsForWorker(workerId: string, statuses: AssignmentStatus[]) {
@@ -331,7 +380,8 @@ export class MemoryWorkerPoolStore implements WorkerPoolStore {
   }
 
   async createRequestedAssignment(input: { sessionId: string; modelId: string; purpose: WorkerRuntime; now: Date; leaseSeconds: number }) {
-    const existingId = this.assignmentIdBySession.get(input.sessionId);
+    const key = assignmentKey(input.sessionId, input.purpose);
+    const existingId = this.assignmentIdBySessionPurpose.get(key);
     if (existingId) return cloneAssignment(this.assignments.get(existingId)!);
     const assignment: AssignmentRecord = {
       id: randomUUID(),
@@ -348,14 +398,23 @@ export class MemoryWorkerPoolStore implements WorkerPoolStore {
       updatedAt: input.now,
     };
     this.assignments.set(assignment.id, assignment);
-    this.assignmentIdBySession.set(assignment.sessionId, assignment.id);
+    this.assignmentIdBySessionPurpose.set(key, assignment.id);
     return cloneAssignment(assignment);
   }
 
-  async getAssignmentBySession(sessionId: string) {
-    const id = this.assignmentIdBySession.get(sessionId);
-    const assignment = id ? this.assignments.get(id) : undefined;
-    return assignment ? cloneAssignment(assignment) : null;
+  async getAssignmentBySession(sessionId: string, purpose?: WorkerRuntime) {
+    if (purpose) {
+      const id = this.assignmentIdBySessionPurpose.get(assignmentKey(sessionId, purpose));
+      const assignment = id ? this.assignments.get(id) : undefined;
+      return assignment ? cloneAssignment(assignment) : null;
+    }
+    return (await this.listAssignmentsBySession(sessionId))[0] ?? null;
+  }
+
+  async listAssignmentsBySession(sessionId: string) {
+    return sortAssignments([...this.assignments.values()]
+      .filter((assignment) => assignment.sessionId === sessionId)
+      .map(cloneAssignment));
   }
 
   async reserveReadyWorker(assignmentId: string, now: Date, leaseSeconds: number) {
@@ -401,22 +460,51 @@ export class MemoryWorkerPoolStore implements WorkerPoolStore {
     return cloneAssignment(assignment);
   }
 
-  async touch(sessionId: string, now: Date, leaseSeconds: number) {
-    const assignmentId = this.assignmentIdBySession.get(sessionId);
-    const stored = assignmentId ? this.assignments.get(assignmentId) : undefined;
-    if (!stored || (stored.status !== "ready" && stored.status !== "active")) {
-      return stored ? cloneAssignment(stored) : null;
+  async touch(sessionId: string, now: Date, leaseSeconds: number, purpose?: WorkerRuntime) {
+    const touched: AssignmentRecord[] = [];
+    for (const stored of this.assignments.values()) {
+      if (stored.sessionId !== sessionId) continue;
+      if (purpose && stored.purpose !== purpose) continue;
+      if (stored.status === "ready" || stored.status === "active") {
+        stored.status = "active";
+        stored.activatedAt ??= now;
+        stored.leaseExpiresAt = leaseUntil(now, leaseSeconds);
+        stored.updatedAt = now;
+      }
+      touched.push(cloneAssignment(stored));
     }
-    stored.status = "active";
-    stored.activatedAt ??= now;
-    stored.leaseExpiresAt = leaseUntil(now, leaseSeconds);
-    stored.updatedAt = now;
-    return cloneAssignment(stored);
+    return sortAssignments(touched);
   }
 
-  async release(sessionId: string, now: Date) {
-    const assignmentId = this.assignmentIdBySession.get(sessionId);
-    const stored = assignmentId ? this.assignments.get(assignmentId) : undefined;
+  async requeueAssignmentsForWorker(
+    workerId: string,
+    now: Date,
+    leaseSeconds: number,
+    message: string,
+  ) {
+    const requeued: AssignmentRecord[] = [];
+    for (const assignment of this.assignments.values()) {
+      if (
+        assignment.workerId !== workerId
+        || (assignment.status !== "ready" && assignment.status !== "active")
+      ) continue;
+      assignment.workerId = null;
+      assignment.status = "requested";
+      assignment.message = message;
+      assignment.leaseExpiresAt = leaseUntil(now, leaseSeconds);
+      assignment.updatedAt = now;
+      requeued.push(cloneAssignment(assignment));
+    }
+    const worker = this.workers.get(workerId);
+    if (worker && requeued.length > 0) {
+      worker.activeSessions = Math.max(0, worker.activeSessions - requeued.length);
+      worker.updatedAt = now;
+    }
+    return sortAssignments(requeued);
+  }
+
+  async releaseAssignment(assignmentId: string, now: Date) {
+    const stored = this.assignments.get(assignmentId);
     if (!stored) return null;
     if (stored.status === "released") return cloneAssignment(stored);
     if ((stored.status === "ready" || stored.status === "active") && stored.workerId) {
@@ -430,6 +518,16 @@ export class MemoryWorkerPoolStore implements WorkerPoolStore {
     stored.releasedAt = now;
     stored.updatedAt = now;
     return cloneAssignment(stored);
+  }
+
+  async release(sessionId: string, now: Date) {
+    const released: AssignmentRecord[] = [];
+    for (const stored of this.assignments.values()) {
+      if (stored.sessionId !== sessionId) continue;
+      const assignment = await this.releaseAssignment(stored.id, now);
+      if (assignment) released.push(assignment);
+    }
+    return sortAssignments(released);
   }
 
   async reapExpired(now: Date) {
@@ -601,6 +699,16 @@ export class PostgresWorkerPoolStore implements WorkerPoolStore {
     try {
       const [row] = await this.database.select({ value: sql<number>`count(*)::int` })
         .from(transcriptionAssignments)
+        .where(inArray(transcriptionAssignments.status, statuses));
+      return Number(row?.value || 0);
+    } catch (error) { this.fail(error); }
+  }
+
+  async countActiveSessions(statuses: AssignmentStatus[]) {
+    try {
+      const [row] = await this.database.select({
+        value: sql<number>`count(distinct ${transcriptionAssignments.sessionId})::int`,
+      }).from(transcriptionAssignments)
         .where(inArray(transcriptionAssignments.status, statuses));
       return Number(row?.value || 0);
     } catch (error) { this.fail(error); }
@@ -809,38 +917,95 @@ export class PostgresWorkerPoolStore implements WorkerPoolStore {
 
   async createRequestedAssignment(input: { sessionId: string; modelId: string; purpose: WorkerRuntime; now: Date; leaseSeconds: number }) {
     try {
-      await this.database.insert(transcriptionAssignments).values({
-        id: randomUUID(),
-        sessionId: input.sessionId,
-        workerId: null,
-        modelId: input.modelId,
-        purpose: input.purpose,
-        status: "requested",
-        message: "利用可能なGPUワーカーを探しています",
-        leaseExpiresAt: leaseUntil(input.now, input.leaseSeconds),
-        activatedAt: null,
-        releasedAt: null,
-        createdAt: input.now,
-        updatedAt: input.now,
-      }).onConflictDoNothing({ target: transcriptionAssignments.sessionId });
-      const [row] = await this.database.select().from(transcriptionAssignments)
-        .where(eq(transcriptionAssignments.sessionId, input.sessionId)).limit(1);
-      if (!row) throw new StoreError("assignment_not_found", "ワーカー割当を作成できませんでした", 503);
-      return mapAssignment(row);
+      return await this.database.transaction(async (transaction) => {
+        const [session] = await transaction.select({
+          status: transcriptionSessions.status,
+          expiresAt: transcriptionSessions.expiresAt,
+        })
+          .from(transcriptionSessions)
+          .where(eq(transcriptionSessions.id, input.sessionId))
+          .limit(1)
+          .for("update");
+        if (!session) {
+          throw new StoreError("transcription_not_found", "文字起こしセッションが見つかりません", 404);
+        }
+        if (session.expiresAt <= input.now) {
+          throw new StoreError(
+            "transcription_not_found",
+            "文字起こしセッションが見つかりません",
+            404,
+          );
+        }
+        if (session.status !== "recording") {
+          throw new StoreError(
+            "transcription_not_active",
+            "完了済みの文字起こしにはGPUを割り当てられません",
+            409,
+          );
+        }
+        const predicate = and(
+          eq(transcriptionAssignments.sessionId, input.sessionId),
+          eq(transcriptionAssignments.purpose, input.purpose),
+        );
+        const [existing] = await transaction.select().from(transcriptionAssignments)
+          .where(predicate).limit(1);
+        if (existing) return mapAssignment(existing);
+        const [inserted] = await transaction.insert(transcriptionAssignments).values({
+          id: randomUUID(),
+          sessionId: input.sessionId,
+          workerId: null,
+          modelId: input.modelId,
+          purpose: input.purpose,
+          status: "requested",
+          message: "利用可能なGPUワーカーを探しています",
+          leaseExpiresAt: leaseUntil(input.now, input.leaseSeconds),
+          activatedAt: null,
+          releasedAt: null,
+          createdAt: input.now,
+          updatedAt: input.now,
+        }).returning();
+        if (inserted) return mapAssignment(inserted);
+        const [row] = await transaction.select().from(transcriptionAssignments)
+          .where(predicate).limit(1);
+        if (!row) throw new StoreError("assignment_not_found", "ワーカー割当を作成できませんでした", 503);
+        return mapAssignment(row);
+      });
     } catch (error) { this.fail(error); }
   }
 
-  async getAssignmentBySession(sessionId: string) {
+  async getAssignmentBySession(sessionId: string, purpose?: WorkerRuntime) {
     try {
       const [row] = await this.database.select().from(transcriptionAssignments)
-        .where(eq(transcriptionAssignments.sessionId, sessionId)).limit(1);
+        .where(and(
+          eq(transcriptionAssignments.sessionId, sessionId),
+          ...(purpose ? [eq(transcriptionAssignments.purpose, purpose)] : []),
+        ))
+        .orderBy(sql`case when ${transcriptionAssignments.purpose} = 'realtime' then 0 else 1 end`)
+        .limit(1);
       return row ? mapAssignment(row) : null;
+    } catch (error) { this.fail(error); }
+  }
+
+  async listAssignmentsBySession(sessionId: string) {
+    try {
+      const rows = await this.database.select().from(transcriptionAssignments)
+        .where(eq(transcriptionAssignments.sessionId, sessionId))
+        .orderBy(sql`case when ${transcriptionAssignments.purpose} = 'realtime' then 0 else 1 end`);
+      return rows.map(mapAssignment);
     } catch (error) { this.fail(error); }
   }
 
   async reserveReadyWorker(assignmentId: string, now: Date, leaseSeconds: number) {
     try {
       return await this.database.transaction(async (transaction) => {
+        const [candidate] = await transaction.select().from(transcriptionAssignments)
+          .where(eq(transcriptionAssignments.id, assignmentId)).limit(1);
+        if (!candidate) throw new StoreError("assignment_not_found", "ワーカー割当が見つかりません", 404);
+        await transaction.select({ id: legacyTranscriptionAssignments.id })
+          .from(legacyTranscriptionAssignments)
+          .where(eq(legacyTranscriptionAssignments.sessionId, candidate.sessionId))
+          .limit(1)
+          .for("update");
         const [assignment] = await transaction.select().from(transcriptionAssignments)
           .where(eq(transcriptionAssignments.id, assignmentId)).limit(1).for("update");
         if (!assignment) throw new StoreError("assignment_not_found", "ワーカー割当が見つかりません", 404);
@@ -874,52 +1039,148 @@ export class PostgresWorkerPoolStore implements WorkerPoolStore {
 
   async markProvisioning(assignmentId: string, workerId: string | null, message: string, now: Date, leaseSeconds: number) {
     try {
-      const [row] = await this.database.update(transcriptionAssignments).set({
-        workerId,
-        status: "provisioning",
-        message,
-        leaseExpiresAt: leaseUntil(now, leaseSeconds),
-        updatedAt: now,
-      }).where(and(
-        eq(transcriptionAssignments.id, assignmentId),
-        inArray(transcriptionAssignments.status, ["requested", "provisioning"]),
-      )).returning();
-      if (row) return mapAssignment(row);
-      const [existing] = await this.database.select().from(transcriptionAssignments).where(eq(transcriptionAssignments.id, assignmentId)).limit(1);
-      if (!existing) throw new StoreError("assignment_not_found", "ワーカー割当が見つかりません", 404);
-      return mapAssignment(existing);
+      return await this.database.transaction(async (transaction) => {
+        const [candidate] = await transaction.select().from(transcriptionAssignments)
+          .where(eq(transcriptionAssignments.id, assignmentId)).limit(1);
+        if (!candidate) throw new StoreError("assignment_not_found", "ワーカー割当が見つかりません", 404);
+        await transaction.select({ id: legacyTranscriptionAssignments.id })
+          .from(legacyTranscriptionAssignments)
+          .where(eq(legacyTranscriptionAssignments.sessionId, candidate.sessionId))
+          .limit(1)
+          .for("update");
+        const [row] = await transaction.update(transcriptionAssignments).set({
+          workerId,
+          status: "provisioning",
+          message,
+          leaseExpiresAt: leaseUntil(now, leaseSeconds),
+          updatedAt: now,
+        }).where(and(
+          eq(transcriptionAssignments.id, assignmentId),
+          inArray(transcriptionAssignments.status, ["requested", "provisioning"]),
+        )).returning();
+        if (row) return mapAssignment(row);
+        const [existing] = await transaction.select().from(transcriptionAssignments)
+          .where(eq(transcriptionAssignments.id, assignmentId)).limit(1);
+        if (!existing) throw new StoreError("assignment_not_found", "ワーカー割当が見つかりません", 404);
+        return mapAssignment(existing);
+      });
     } catch (error) { this.fail(error); }
   }
 
   async markFailed(assignmentId: string, message: string, now: Date) {
     try {
-      const [row] = await this.database.update(transcriptionAssignments).set({ status: "failed", message, updatedAt: now })
-        .where(eq(transcriptionAssignments.id, assignmentId)).returning();
-      if (!row) throw new StoreError("assignment_not_found", "ワーカー割当が見つかりません", 404);
-      return mapAssignment(row);
+      return await this.database.transaction(async (transaction) => {
+        const [candidate] = await transaction.select().from(transcriptionAssignments)
+          .where(eq(transcriptionAssignments.id, assignmentId)).limit(1);
+        if (!candidate) throw new StoreError("assignment_not_found", "ワーカー割当が見つかりません", 404);
+        await transaction.select({ id: legacyTranscriptionAssignments.id })
+          .from(legacyTranscriptionAssignments)
+          .where(eq(legacyTranscriptionAssignments.sessionId, candidate.sessionId))
+          .limit(1)
+          .for("update");
+        const [row] = await transaction.update(transcriptionAssignments)
+          .set({ status: "failed", message, updatedAt: now })
+          .where(eq(transcriptionAssignments.id, assignmentId)).returning();
+        if (!row) throw new StoreError("assignment_not_found", "ワーカー割当が見つかりません", 404);
+        return mapAssignment(row);
+      });
     } catch (error) { this.fail(error); }
   }
 
-  async touch(sessionId: string, now: Date, leaseSeconds: number) {
-    try {
-      const [row] = await this.database.update(transcriptionAssignments).set({
-        status: "active",
-        activatedAt: sql`coalesce(${transcriptionAssignments.activatedAt}, ${now})`,
-        leaseExpiresAt: leaseUntil(now, leaseSeconds),
-        updatedAt: now,
-      }).where(and(
-        eq(transcriptionAssignments.sessionId, sessionId),
-        inArray(transcriptionAssignments.status, ["ready", "active"]),
-      )).returning();
-      return row ? mapAssignment(row) : await this.getAssignmentBySession(sessionId);
-    } catch (error) { this.fail(error); }
-  }
-
-  async release(sessionId: string, now: Date) {
+  async touch(sessionId: string, now: Date, leaseSeconds: number, purpose?: WorkerRuntime) {
     try {
       return await this.database.transaction(async (transaction) => {
+        await transaction.select({ id: legacyTranscriptionAssignments.id })
+          .from(legacyTranscriptionAssignments)
+          .where(eq(legacyTranscriptionAssignments.sessionId, sessionId))
+          .limit(1)
+          .for("update");
+        await transaction.update(transcriptionAssignments).set({
+          status: "active",
+          activatedAt: sql`coalesce(${transcriptionAssignments.activatedAt}, ${now})`,
+          leaseExpiresAt: leaseUntil(now, leaseSeconds),
+          updatedAt: now,
+        }).where(and(
+          eq(transcriptionAssignments.sessionId, sessionId),
+          ...(purpose ? [eq(transcriptionAssignments.purpose, purpose)] : []),
+          inArray(transcriptionAssignments.status, ["ready", "active"]),
+        ));
+        const rows = await transaction.select().from(transcriptionAssignments)
+          .where(and(
+            eq(transcriptionAssignments.sessionId, sessionId),
+            ...(purpose ? [eq(transcriptionAssignments.purpose, purpose)] : []),
+          ))
+          .orderBy(sql`case when ${transcriptionAssignments.purpose} = 'realtime' then 0 else 1 end`);
+        return rows.map(mapAssignment);
+      });
+    } catch (error) { this.fail(error); }
+  }
+
+  async requeueAssignmentsForWorker(
+    workerId: string,
+    now: Date,
+    leaseSeconds: number,
+    message: string,
+  ) {
+    try {
+      return await this.database.transaction(async (transaction) => {
+        const candidates = await transaction.select().from(transcriptionAssignments)
+          .where(and(
+            eq(transcriptionAssignments.workerId, workerId),
+            inArray(transcriptionAssignments.status, ["ready", "active"]),
+          ))
+          .orderBy(asc(transcriptionAssignments.sessionId), asc(transcriptionAssignments.id));
+        if (candidates.length === 0) return [];
+        const sessionIds = [...new Set(candidates.map((assignment) => assignment.sessionId))].sort();
+        await transaction.select({ id: legacyTranscriptionAssignments.id })
+          .from(legacyTranscriptionAssignments)
+          .where(inArray(legacyTranscriptionAssignments.sessionId, sessionIds))
+          .orderBy(asc(legacyTranscriptionAssignments.sessionId))
+          .for("update");
+        const assignments = await transaction.select().from(transcriptionAssignments)
+          .where(and(
+            eq(transcriptionAssignments.workerId, workerId),
+            inArray(transcriptionAssignments.status, ["ready", "active"]),
+            inArray(transcriptionAssignments.id, candidates.map((assignment) => assignment.id)),
+          ))
+          .orderBy(asc(transcriptionAssignments.id))
+          .for("update");
+        if (assignments.length === 0) return [];
+        const rows = await transaction.update(transcriptionAssignments).set({
+          workerId: null,
+          status: "requested",
+          message,
+          leaseExpiresAt: leaseUntil(now, leaseSeconds),
+          updatedAt: now,
+        }).where(and(
+          eq(transcriptionAssignments.workerId, workerId),
+          inArray(transcriptionAssignments.status, ["ready", "active"]),
+          inArray(transcriptionAssignments.id, assignments.map((assignment) => assignment.id)),
+        )).returning();
+        if (rows.length > 0) {
+          await transaction.update(inferenceWorkers).set({
+            activeSessions: sql`greatest(${inferenceWorkers.activeSessions} - ${rows.length}, 0)`,
+            updatedAt: now,
+          }).where(eq(inferenceWorkers.id, workerId));
+        }
+        return sortAssignments(rows.map(mapAssignment));
+      });
+    } catch (error) { this.fail(error); }
+  }
+
+  async releaseAssignment(assignmentId: string, now: Date) {
+    try {
+      return await this.database.transaction(async (transaction) => {
+        const [candidate] = await transaction.select().from(transcriptionAssignments)
+          .where(eq(transcriptionAssignments.id, assignmentId)).limit(1);
+        if (!candidate) return null;
+        await transaction.select({ id: legacyTranscriptionAssignments.id })
+          .from(legacyTranscriptionAssignments)
+          .where(eq(legacyTranscriptionAssignments.sessionId, candidate.sessionId))
+          .limit(1)
+          .for("update");
         const [assignment] = await transaction.select().from(transcriptionAssignments)
-          .where(eq(transcriptionAssignments.sessionId, sessionId)).limit(1).for("update");
+          .where(eq(transcriptionAssignments.id, assignmentId)).limit(1).for("update");
         if (!assignment) return null;
         if (assignment.status === "released") return mapAssignment(assignment);
         if ((assignment.status === "ready" || assignment.status === "active") && assignment.workerId) {
@@ -938,15 +1199,92 @@ export class PostgresWorkerPoolStore implements WorkerPoolStore {
     } catch (error) { this.fail(error); }
   }
 
+  async release(sessionId: string, now: Date) {
+    try {
+      return await this.database.transaction(async (transaction) => {
+        await transaction.select({ id: transcriptionSessions.id })
+          .from(transcriptionSessions)
+          .where(eq(transcriptionSessions.id, sessionId))
+          .limit(1)
+          .for("update");
+        await transaction.select({ id: legacyTranscriptionAssignments.id })
+          .from(legacyTranscriptionAssignments)
+          .where(eq(legacyTranscriptionAssignments.sessionId, sessionId))
+          .limit(1)
+          .for("update");
+        const assignments = await transaction.select().from(transcriptionAssignments)
+          .where(eq(transcriptionAssignments.sessionId, sessionId))
+          .orderBy(asc(transcriptionAssignments.id))
+          .for("update");
+        const decrementPlan = buildWorkerDecrementPlan(assignments);
+        const decrementByWorker = new Map(decrementPlan.map((item) => [item.workerId, item.count]));
+        // Assignment UUID order can map to opposite worker orders across sessions.
+        // Let Postgres establish one worker-ID order before changing any counter.
+        const lockedWorkers = decrementPlan.length > 0
+          ? await transaction.select({ id: inferenceWorkers.id }).from(inferenceWorkers)
+              .where(inArray(inferenceWorkers.id, decrementPlan.map((item) => item.workerId)))
+              .orderBy(asc(inferenceWorkers.id))
+              .for("update")
+          : [];
+        const released: AssignmentRecord[] = [];
+        for (const assignment of assignments) {
+          if (assignment.status !== "released") {
+            const [saved] = await transaction.update(transcriptionAssignments).set({
+              status: "released",
+              releasedAt: now,
+              updatedAt: now,
+            }).where(eq(transcriptionAssignments.id, assignment.id)).returning();
+            released.push(mapAssignment(saved));
+          } else {
+            released.push(mapAssignment(assignment));
+          }
+        }
+        for (const worker of lockedWorkers) {
+          const count = decrementByWorker.get(worker.id) ?? 0;
+          if (count === 0) continue;
+          await transaction.update(inferenceWorkers).set({
+            activeSessions: sql`greatest(${inferenceWorkers.activeSessions} - ${count}, 0)`,
+            updatedAt: now,
+          }).where(eq(inferenceWorkers.id, worker.id));
+        }
+        return sortAssignments(released);
+      });
+    } catch (error) { this.fail(error); }
+  }
+
   async reapExpired(now: Date) {
     try {
       return await this.database.transaction(async (transaction) => {
-        const assignments = await transaction.select().from(transcriptionAssignments)
+        const candidates = await transaction.select().from(transcriptionAssignments)
           .where(and(
             lt(transcriptionAssignments.leaseExpiresAt, now),
             inArray(transcriptionAssignments.status, ["requested", "provisioning", "ready", "active"]),
           ))
+          .orderBy(asc(transcriptionAssignments.sessionId), asc(transcriptionAssignments.id));
+        if (candidates.length === 0) return 0;
+        const sessionIds = [...new Set(candidates.map((assignment) => assignment.sessionId))].sort();
+        await transaction.select({ id: legacyTranscriptionAssignments.id })
+          .from(legacyTranscriptionAssignments)
+          .where(inArray(legacyTranscriptionAssignments.sessionId, sessionIds))
+          .orderBy(asc(legacyTranscriptionAssignments.sessionId))
+          .for("update");
+        const assignments = await transaction.select().from(transcriptionAssignments)
+          .where(and(
+            lt(transcriptionAssignments.leaseExpiresAt, now),
+            inArray(transcriptionAssignments.status, ["requested", "provisioning", "ready", "active"]),
+            inArray(transcriptionAssignments.id, candidates.map((assignment) => assignment.id)),
+          ))
+          .orderBy(asc(transcriptionAssignments.id))
           .for("update", { skipLocked: true });
+        const lockPlan = buildWorkerDecrementPlan(assignments);
+        // Match release(): every multi-worker counter path locks in DB worker-ID order.
+        const lockedWorkers = lockPlan.length > 0
+          ? await transaction.select({ id: inferenceWorkers.id }).from(inferenceWorkers)
+              .where(inArray(inferenceWorkers.id, lockPlan.map((item) => item.workerId)))
+              .orderBy(asc(inferenceWorkers.id))
+              .for("update")
+          : [];
+        const releasedForWorkers: typeof assignments = [];
         let releasedCount = 0;
         for (const assignment of assignments) {
           const [released] = await transaction.update(transcriptionAssignments).set({
@@ -959,13 +1297,19 @@ export class PostgresWorkerPoolStore implements WorkerPoolStore {
             inArray(transcriptionAssignments.status, ["requested", "provisioning", "ready", "active"]),
           )).returning({ id: transcriptionAssignments.id });
           if (!released) continue;
-          if ((assignment.status === "ready" || assignment.status === "active") && assignment.workerId) {
-            await transaction.update(inferenceWorkers).set({
-              activeSessions: sql`greatest(${inferenceWorkers.activeSessions} - 1, 0)`,
-              updatedAt: now,
-            }).where(eq(inferenceWorkers.id, assignment.workerId));
-          }
+          releasedForWorkers.push(assignment);
           releasedCount += 1;
+        }
+        const decrementByWorker = new Map(
+          buildWorkerDecrementPlan(releasedForWorkers).map((item) => [item.workerId, item.count]),
+        );
+        for (const worker of lockedWorkers) {
+          const count = decrementByWorker.get(worker.id) ?? 0;
+          if (count === 0) continue;
+          await transaction.update(inferenceWorkers).set({
+            activeSessions: sql`greatest(${inferenceWorkers.activeSessions} - ${count}, 0)`,
+            updatedAt: now,
+          }).where(eq(inferenceWorkers.id, worker.id));
         }
         return releasedCount;
       });

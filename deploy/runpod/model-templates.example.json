@@ -4,5 +4,11 @@
     "runtime": "realtime",
     "template_id": "replace-with-context-worker-template-id",
     "max_sessions": 32
+  },
+  {
+    "model_id": "infodeliverailab/lab_asr_diarization_v1",
+    "runtime": "batch",
+    "template_id": "replace-with-lab-batch-worker-template-id",
+    "max_sessions": 1
   }
 ]

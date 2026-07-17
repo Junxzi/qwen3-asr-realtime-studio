@@ -16,9 +16,10 @@ export function assignmentIsReady(assignment: InferenceAssignment) {
 export function assertAssignmentMatches(
   assignment: InferenceAssignment,
   session: { id: string; model_id: string },
+  expectedModelId = session.model_id,
 ) {
   if (assignment.session_id !== session.id) throw new Error("GPUの割り当て先セッションが一致しません");
-  if (assignment.model_id !== session.model_id) throw new Error("GPUの割り当てモデルが一致しません");
+  if (assignment.model_id !== expectedModelId) throw new Error("GPUの割り当てモデルが一致しません");
 }
 
 export function assignmentMessage(assignment: InferenceAssignment, modelName?: string) {

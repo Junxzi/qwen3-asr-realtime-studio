@@ -52,7 +52,7 @@ jobs:
 
       - name: Verify generated dependency locks
         run: |
-          uv export --frozen --extra gpu --no-dev --no-emit-project \
+          uv export --frozen --extra gpu --extra batch --no-dev --no-emit-project \
             --output-file requirements.asr.lock
           git diff --exit-code -- requirements.asr.lock
           uv pip compile requirements.diarizer.in \
@@ -75,7 +75,7 @@ jobs:
           WORKER_TICKET_SECRET: ci-ticket-secret-at-least-32-characters
           PORT: "18080"
         run: |
-          bash -n scripts/entrypoint.sh scripts/run_all.sh
+          bash -n scripts/entrypoint.sh scripts/run_all.sh scripts/run_lab_batch.sh
           MODELS_LOCK_PATH="$PWD/config/models.lock.json" \
             CATALOG_PATH="$PWD/config/not-present.json" \
             uv run --no-sync python scripts/preflight.py

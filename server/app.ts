@@ -9,6 +9,7 @@ import { DEFAULT_ASR_MODEL_ID, listAsrModels } from "./asr-models.js";
 import { clearSessionCookie, passwordMatches, requireAllowedOrigin, requireAuth, setSessionCookie } from "./auth.js";
 import type { AppConfig } from "./config.js";
 import { createTranscriptionStore } from "./postgres-store.js";
+import { DEFAULT_PROCESSING_MODE, listProcessingProfiles } from "./processing-modes.js";
 import { ProviderError } from "./runpod.js";
 import { registerTranscriptionRoutes } from "./transcription-routes.js";
 import { StoreError, type TranscriptionStore } from "./transcriptions.js";
@@ -77,13 +78,28 @@ export function createApp(
     clearSessionCookie(response, config);
     response.json({ data: { authenticated: false } });
   });
-  app.get("/api/models", authenticated, (_request, response) => {
-    response.json({
-      data: {
-        items: listAsrModels(),
-        default_model_id: DEFAULT_ASR_MODEL_ID,
-      },
-    });
+  app.get("/api/models", authenticated, async (_request, response, next) => {
+    try {
+      const pool = await scheduler.diagnostics();
+      response.json({
+        data: {
+          items: listAsrModels(),
+          default_model_id: DEFAULT_ASR_MODEL_ID,
+          processing_modes: listProcessingProfiles({
+            workers: pool.workers.map((worker) => ({
+              enabled: worker.enabled,
+              modelId: worker.model_id,
+              runtime: worker.runtime,
+            })),
+            modelTemplates: config.modelTemplates,
+            canProvision: scheduler.canProvisionWorkers(),
+          }),
+          default_processing_mode: DEFAULT_PROCESSING_MODE,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
   });
   registerTranscriptionRoutes(app, config, store, authenticated, requireAllowedOrigin(config), now, scheduler);
   registerWorkerRoutes(app, store, scheduler, authenticated, requireAllowedOrigin(config), now);

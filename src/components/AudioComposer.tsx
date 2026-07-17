@@ -1,7 +1,7 @@
 import { Check, CloudUpload, LoaderCircle, Mic, MicOff, RotateCcw, Square } from "lucide-react";
 import { assignmentMessage } from "@/assignment";
 import { formatClock } from "@/lib/format";
-import type { AsrModel, InferenceAssignment } from "@/types";
+import type { AsrModel, InferenceAssignment, ProcessingProfile } from "@/types";
 
 interface AudioComposerProps {
   assignment?: InferenceAssignment | null;
@@ -15,6 +15,7 @@ interface AudioComposerProps {
   pendingSaves: number;
   sourceLabel: string;
   model?: AsrModel;
+  processingProfile?: ProcessingProfile;
   onMicrophone: () => void;
   onFile: (file: File) => void;
   onStop: () => void;
@@ -34,6 +35,7 @@ export function AudioComposer({
   pendingSaves,
   sourceLabel,
   model,
+  processingProfile,
   onMicrophone,
   onFile,
   onStop,
@@ -41,12 +43,14 @@ export function AudioComposer({
   onCancel,
 }: AudioComposerProps) {
   const active = capturing || finalizing || completionRetryRequired;
-  const supportsMicrophone = Boolean(model?.input_modes.includes("microphone"));
-  const supportsFile = Boolean(model?.input_modes.includes("file"));
+  const inputModes = processingProfile?.input_modes || model?.input_modes || [];
+  const supportsMicrophone = inputModes.includes("microphone");
+  const supportsFile = inputModes.includes("file");
+  const batchOnly = processingProfile ? processingProfile.id === "batch" : model?.runtime === "batch";
   const status = completionRetryRequired
     ? "保存とGPU解放を再試行してください"
     : finalizing
-    ? (model?.runtime === "batch" ? "ファイルを文字起こし中" : "発話を確定しています")
+    ? (batchOnly ? "ファイルを文字起こし中" : "発話を確定しています")
     : capturing
       ? "文字起こし中"
       : assignment && (assignment.status === "requested" || assignment.status === "provisioning" || assignment.status === "failed")
@@ -59,7 +63,7 @@ export function AudioComposer({
               ? "GPUの割り当てを要求しています"
               : !model
                 ? "モデル情報を読み込んでいます"
-                : model.runtime === "batch" ? "音声ファイルを選択" : "文字起こしを開始";
+              : batchOnly ? "音声ファイルを選択" : "文字起こしを開始";
 
   return (
     <div className="composer-wrap">

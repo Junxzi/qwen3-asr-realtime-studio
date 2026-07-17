@@ -4,6 +4,7 @@ import type { PersistUtteranceInput } from "./types";
 const DATABASE_NAME = "infodeliver-asr-studio";
 const STORE_NAME = "transcription-outbox";
 const VERSION = 1;
+const REVISION_KEY_SEPARATOR = "::revision::";
 export const OUTBOX_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface OutboxItem {
@@ -54,13 +55,16 @@ async function withStore<T>(mode: IDBTransactionMode, operation: (store: IDBObje
   }
 }
 
-export function outboxKey(sessionId: string, utteranceId: string) {
-  return `${sessionId}:${utteranceId}`;
+export function outboxKey(sessionId: string, utteranceId: string, revision?: number) {
+  const utteranceKey = `${sessionId}:${utteranceId}`;
+  return revision === undefined
+    ? utteranceKey
+    : `${utteranceKey}${REVISION_KEY_SEPARATOR}${revision}`;
 }
 
 export async function enqueueOutbox(sessionId: string, utteranceId: string, payload: PersistUtteranceInput) {
   const item: OutboxItem = {
-    key: outboxKey(sessionId, utteranceId),
+    key: outboxKey(sessionId, utteranceId, payload.revision),
     sessionId,
     utteranceId,
     payload,
@@ -94,6 +98,8 @@ export async function flushOutbox(save: (item: OutboxItem) => Promise<unknown>) 
   for (const item of items) {
     try {
       await save(item);
+      // Delete only the revision captured by this flush. A newer revision may
+      // have been enqueued under its own key while save() was in flight.
       await removeOutbox(item.key);
       saved += 1;
     } catch (error) {
@@ -104,5 +110,5 @@ export async function flushOutbox(save: (item: OutboxItem) => Promise<unknown>) 
       // Retry transient network/auth/server failures on the next online tick.
     }
   }
-  return { pending: Math.max(0, items.length - saved - discarded), saved, discarded };
+  return { pending: (await listOutbox()).length, saved, discarded };
 }

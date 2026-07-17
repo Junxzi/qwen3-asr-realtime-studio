@@ -27,3 +27,21 @@ REWRITE_VIOLATIONS = Counter(
 )
 CAPACITY_REJECTIONS = Counter("qwen_realtime_capacity_rejections_total", "Rejected new sessions")
 ERRORS = Counter("qwen_realtime_errors_total", "Pipeline errors", ["stage"])
+LAB_BATCH_ACTIVE = Gauge(
+    "qwen_lab_batch_active_requests",
+    "Current lab batch inference requests",
+)
+LAB_BATCH_REQUESTS = Counter(
+    "qwen_lab_batch_requests_total",
+    "Lab batch requests by terminal result",
+    ["result"],
+)
+LAB_BATCH_UPLOAD_BYTES = Counter(
+    "qwen_lab_batch_upload_bytes_total",
+    "Audio bytes accepted by the lab batch worker",
+)
+LAB_BATCH_INFERENCE_LATENCY = Histogram(
+    "qwen_lab_batch_inference_seconds",
+    "Lab model inference wall time",
+    buckets=(0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0),
+)

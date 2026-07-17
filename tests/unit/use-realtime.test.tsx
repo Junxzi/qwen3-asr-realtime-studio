@@ -3,7 +3,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AsrModel, InferenceAssignment, TranscriptionSession } from "../../src/types";
+import type { AsrModel, InferenceAssignment, ProcessingProfile, TranscriptionSession } from "../../src/types";
 import { useRealtime } from "../../src/useRealtime";
 
 const model: AsrModel = {
@@ -28,7 +28,9 @@ const session: TranscriptionSession = {
   title_customized: false,
   status: "recording",
   source: "microphone",
+  processing_mode: "realtime",
   model_id: model.id,
+  final_model_id: null,
   catalog_revision: "r1",
   started_at: new Date(0).toISOString(),
   ended_at: null,
@@ -53,6 +55,24 @@ const assignment: InferenceAssignment = {
     expires_at: new Date(60_000).toISOString(),
     catalog_revision: "r1",
   },
+};
+
+const hybridProfile: ProcessingProfile = {
+  id: "hybrid",
+  display_name: "ライブ＋高精度確定",
+  description: "test",
+  input_modes: ["microphone", "file"],
+  primary_model_id: model.id,
+  final_model_id: "final-model",
+  assignments: [
+    { purpose: "realtime", model_id: model.id },
+    { purpose: "batch", model_id: "final-model" },
+  ],
+  nodes: [
+    { id: "context_asr", label: "Context" },
+    { id: "replace_result", label: "置換" },
+  ],
+  edges: [{ from: "context_asr", to: "replace_result" }],
 };
 
 class FakeWebSocket extends EventTarget {
@@ -232,5 +252,83 @@ describe("useRealtime terminal ordering", () => {
 
     await act(async () => realtime.disconnect());
     expect(onUnexpectedDisconnect).not.toHaveBeenCalled();
+  });
+
+  it("does not erase a newer partial when an older utterance final arrives", async () => {
+    function Harness() {
+      realtime = useRealtime(model);
+      return null;
+    }
+    await act(async () => root.render(<Harness />));
+    const socket = await connectReady(realtime);
+
+    await act(async () => {
+      socket.receive({
+        type: "transcript.partial",
+        utterance_id: "utterance-a",
+        revision: 1,
+        stable_text: "古い",
+        unstable_text: "発話",
+        audio_end_ms: 1_000,
+      });
+      socket.receive({
+        type: "transcript.partial",
+        utterance_id: "utterance-b",
+        revision: 1,
+        stable_text: "新しい",
+        unstable_text: "発話",
+        audio_end_ms: 1_500,
+      });
+      socket.receive({
+        type: "transcript.final",
+        utterance_id: "utterance-a",
+        revision: 2,
+        text: "古い発話",
+        words: [],
+        audio_end_ms: 1_000,
+      });
+      await Promise.resolve();
+    });
+
+    expect(realtime.partial?.utterance_id).toBe("utterance-b");
+    expect(realtime.finals.map((item) => item.utterance_id)).toEqual(["utterance-a"]);
+  });
+
+  it("ignores worker replace_result events in hybrid mode", async () => {
+    function Harness() {
+      realtime = useRealtime(model, undefined, undefined, hybridProfile);
+      return null;
+    }
+    await act(async () => root.render(<Harness />));
+    const socket = await connectReady(realtime);
+
+    await act(async () => {
+      socket.receive({
+        type: "pipeline.stage",
+        seq: 1,
+        pipeline_id: "worker-pipeline",
+        utterance_id: "utterance-1",
+        stage: "replace_result",
+        status: "completed",
+        audio_end_ms: 1_000,
+        elapsed_ms: 1,
+        detail_code: "context_final",
+      });
+      socket.receive({
+        type: "pipeline.stage",
+        seq: 2,
+        pipeline_id: "worker-pipeline",
+        utterance_id: "utterance-1",
+        stage: "context_asr",
+        status: "completed",
+        audio_end_ms: 1_000,
+        elapsed_ms: 10,
+        detail_code: null,
+      });
+      await Promise.resolve();
+    });
+
+    expect(realtime.pipeline.log).toHaveLength(1);
+    expect(realtime.pipeline.log[0]?.stage).toBe("context_asr");
   });
 });

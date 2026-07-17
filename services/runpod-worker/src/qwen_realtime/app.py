@@ -39,6 +39,7 @@ from .protocol import (
     ErrorPayload,
     InputEnd,
     ModelLoadRequest,
+    SessionCapabilities,
     SessionReady,
     SessionStart,
     StreamFinalized,
@@ -218,9 +219,17 @@ async def _preload_model(runtime: Runtime) -> None:
         logger.exception("worker model preload failed")
 
 
+def _strong_secret(value: str | None) -> bool:
+    return value is not None and len(value.encode("utf-8")) >= 32
+
+
+def _ticket_required(settings: Settings) -> bool:
+    return settings.require_worker_ticket or settings.asr_backend != "fake"
+
+
 def _security_configured(settings: Settings) -> bool:
-    return bool(settings.worker_admin_secret) and (
-        not settings.require_worker_ticket or bool(settings.worker_ticket_secret)
+    return _strong_secret(settings.worker_admin_secret) and (
+        not _ticket_required(settings) or _strong_secret(settings.worker_ticket_secret)
     )
 
 
@@ -287,7 +296,7 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
     async def require_admin(
         authorization: str | None = Header(default=None),
     ) -> None:
-        if not runtime.settings.worker_admin_secret:
+        if not _strong_secret(runtime.settings.worker_admin_secret):
             raise WorkerAPIError(
                 503,
                 "admin_auth_not_configured",
@@ -451,10 +460,20 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
                 await websocket.close(code=1008)
                 return
 
-            ticket_required = runtime.settings.require_worker_ticket
+            if not _strong_secret(runtime.settings.worker_admin_secret):
+                await websocket.send_json(
+                    ErrorPayload(
+                        code="worker_auth_misconfigured",
+                        message="worker administration authentication is not securely configured",
+                    ).model_dump()
+                )
+                await websocket.close(code=1011)
+                return
+
+            ticket_required = _ticket_required(runtime.settings)
             ticket_present = start.connection_ticket is not None
             if ticket_required or ticket_present:
-                if not runtime.settings.worker_ticket_secret:
+                if not _strong_secret(runtime.settings.worker_ticket_secret):
                     await websocket.send_json(
                         ErrorPayload(
                             code="worker_auth_misconfigured",
@@ -556,6 +575,14 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
                     catalog_revision=runtime.catalog.revision,
                     worker_id=runtime.settings.worker_id,
                     model_id=runtime.settings.model_id,
+                    pipeline_id=runtime.settings.pipeline_id,
+                    capabilities=SessionCapabilities(
+                        final_word_timestamps=(
+                            runtime.settings.enable_aligner
+                            and runtime.settings.asr_backend
+                            in {"qwen_vllm", "qwen_async_vllm"}
+                        )
+                    ),
                 ).model_dump()
             )
 

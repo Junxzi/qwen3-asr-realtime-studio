@@ -22,6 +22,20 @@
       "when": 1784250000000,
       "tag": "0002_unique_worker_pod",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1784300400000,
+      "tag": "0003_processing_modes",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1784304000000,
+      "tag": "0004_utterance_audio_start",
+      "breakpoints": true
     }
   ]
 }

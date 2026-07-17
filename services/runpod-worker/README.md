@@ -1,5 +1,63 @@
 # Qwen3-ASR RunPod Worker
 
+## `lab_asr_diarization_v1` batch worker
+
+`WORKER_RUNTIME=batch`は、同時実行数1のHTTP workerを起動し、プロセス起動時に
+`lab_asr_diarization_v1`を一度だけloadします。`POST /v1/audio/transcriptions`は
+`purpose=batch`へ束縛した短期ticketを必要とします。`max_new_tokens`は既定800、
+上限1024です。uploadした音声はリクエスト終了時の`finally`で削除します。
+
+batch workerもproduction image内の`/opt/venvs/asr`を使用します。PodやNetwork
+Volume上のvenvを正規経路にせず、起動時にrepoの`setup.sh`も実行しません。private
+codeと重みはimageへ焼き込まず、`run_all.sh`が`bootstrap_lab_batch.py`を呼び、
+`/workspace/lab-asr-poc`へ次のfull revisionを自動配置します。
+
+| 配置先 | Hugging Face repo | 固定revision |
+| --- | --- | --- |
+| `lab_asr_diarization_v1` | `infodeliverailab/lab_asr_diarization_v1` | `651c6d0f303557332293afa9fa15e1dd30456606` |
+| `base_model` | `Qwen/Qwen3-ASR-1.7B` | `b188e100bd85038c06d2812d24a39776eba774ca` |
+| `pretrained_ecapa` | `speechbrain/spkrec-ecapa-voxceleb` | `0f99f2d0ebe89ac095bcc5903c4dd8f72b367286` |
+
+初回配置にはprivate repoを読める`HF_TOKEN`が必要です。downloadは
+`/workspace/lab-asr-poc/.lab-batch-download.lock`の`flock`で直列化され、全snapshotの
+配置後に`/workspace/lab-asr-poc/.lab-batch-models.json`をatomicに書きます。warm
+Volumeではmanifestが期待値と完全一致し、3つのdirectoryが存在すればdownloadを
+繰り返しません。manifest欠落、revision変更、directory欠落時は固定revisionを再配置
+してからworkerを起動します。
+
+組み込みadapterはQwen3-ASRとECAPAのtemporal-interleave pipelineを再構成し、両方を
+常駐させます。別repoを試す場合だけ、ゼロ引数factoryを
+`LAB_BACKEND_FACTORY=module:function`で指定できます。factoryは
+`transcribe_file(audio_path, max_new_tokens=...)`、`transcribe`、`infer_file`、
+`infer`のいずれかを持つresident runnerを返す必要があります。snapshot欠落、import
+失敗、model load失敗では`/ready`を503のまま保ち、利用可能とは報告しません。
+
+```bash
+export WORKER_RUNTIME=batch
+export MODEL_ID=infodeliverailab/lab_asr_diarization_v1
+export LAB_REPO_PATH=/workspace/lab-asr-poc/lab_asr_diarization_v1
+export LAB_REPO_REVISION=651c6d0f303557332293afa9fa15e1dd30456606
+export LAB_PYTHON=/opt/venvs/asr/bin/python
+export BASE_MODEL_DIR=/workspace/lab-asr-poc/base_model
+export LAB_ECAPA_DIR=/workspace/lab-asr-poc/pretrained_ecapa
+export LAB_ALLOWED_ORIGINS=https://your-studio.example
+export WORKER_TICKET_SECRET='same-secret-as-control-plane'
+export WORKER_ADMIN_SECRET='same-admin-secret-as-control-plane'
+/opt/app/scripts/run_all.sh
+```
+
+`LAB_ALLOWED_ORIGINS`はcomma区切りのexact-origin allowlistです。scheme、host、portを
+含む公開Studioのoriginを完全一致で指定します。wildcardは拒否し、未設定時はCORSを
+無効にします。browser form fieldは`audio`、`session_id`、`model_id`、任意の
+`utterance_id`と`max_new_tokens`です。応答には単体処理用`utterances`とhybrid置換用
+`turns`が含まれます。temporary uploadは既定で`/tmp/infodeliver-lab-batch`へ置き、
+起動時に古い`lab-*`を削除します。
+
+batch workerが報告する`max_sessions`は常に1です。TemplateとRailwayの
+`RUNPOD_MODEL_TEMPLATES_JSON`にも`max_sessions: 1`を設定してください。adapter、固定
+bootstrap、CPU契約テストは実装済みですが、実GPU上のmodel loadと実音声推論はまだ
+合格記録がないため、Studioでは`validated=false` / `実GPU検証待ち`として扱います。
+
 Railway上の制御プレーンから複数RunPodへセッションを割り当てるための、単一モデル常駐型GPU Workerです。復旧したQwen3-ASR推論コアをコンテナへ移し、Pod固有のvenvや`/root`に依存しない構成にしています。
 
 ## 不変条件

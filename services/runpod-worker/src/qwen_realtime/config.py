@@ -40,6 +40,13 @@ def _positive_float(name: str, default: float) -> float:
     return parsed
 
 
+def _diarizer_chunk_seconds(name: str, default: float) -> float:
+    parsed = _positive_float(name, default)
+    if parsed >= 2.0:
+        raise ValueError(f"{name} must be less than 2 seconds")
+    return parsed
+
+
 def _integer_at_least(name: str, default: int, minimum: int) -> int:
     value = os.getenv(name)
     parsed = default if value is None or not value.strip() else int(value)
@@ -58,6 +65,7 @@ def _optional_string(name: str) -> str | None:
 @dataclass(frozen=True, slots=True)
 class Settings:
     model_id: str = DEFAULT_MODEL_ID
+    pipeline_id: str = "context_realtime_v1"
     worker_id: str = "local-worker"
     worker_ticket_secret: str | None = None
     require_worker_ticket: bool = True
@@ -90,6 +98,7 @@ class Settings:
     scheduler_max_concurrent_batches: int = 2
     label_delay_ms: int = 320
     diarizer_interval_ms: int = 500
+    diarizer_max_chunk_seconds: float = 1.5
     final_diarization_timeout_seconds: float | None = 4.0
     diarizer_request_timeout_seconds: float = 4.0
     diarizer_cleanup_timeout_seconds: float = 0.5
@@ -113,6 +122,7 @@ class Settings:
     def from_env(cls) -> "Settings":
         return cls(
             model_id=os.getenv("MODEL_ID", DEFAULT_MODEL_ID).strip(),
+            pipeline_id=os.getenv("PIPELINE_ID", "context_realtime_v1").strip(),
             worker_id=(
                 os.getenv("WORKER_ID")
                 or os.getenv("RUNPOD_POD_ID")
@@ -154,6 +164,9 @@ class Settings:
             ),
             label_delay_ms=int(os.getenv("LABEL_DELAY_MS", "320")),
             diarizer_interval_ms=int(os.getenv("DIARIZER_INTERVAL_MS", "500")),
+            diarizer_max_chunk_seconds=_diarizer_chunk_seconds(
+                "DIARIZER_MAX_CHUNK_SECONDS", 1.5
+            ),
             final_diarization_timeout_seconds=(
                 _optional_positive_float("FINAL_DIARIZATION_TIMEOUT_SECONDS") or 4.0
             ),

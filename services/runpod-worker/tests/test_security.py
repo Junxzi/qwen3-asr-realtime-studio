@@ -7,6 +7,7 @@ from qwen_realtime.security import (
     create_worker_ticket,
     secrets_match,
     verify_worker_ticket,
+    verify_worker_ticket_envelope,
 )
 
 
@@ -65,6 +66,49 @@ def test_ticket_rejects_tampering_and_binding_mismatch(field, value):
 def test_secret_comparison():
     assert secrets_match("same", "same") is True
     assert secrets_match("same", "different") is False
+
+
+def test_batch_ticket_is_distinct_from_realtime_ticket():
+    arguments = {
+        "secret": "secret",
+        "worker_id": "worker-1",
+        "session_id": "session-1",
+        "model_id": "org/model",
+    }
+    ticket = create_worker_ticket(
+        **arguments,
+        purpose="batch",
+        expires_at=2_000_000_000,
+    )
+    claims = verify_worker_ticket(
+        ticket,
+        **arguments,
+        purpose="batch",
+        now=1_900_000_000,
+    )
+    assert claims["purpose"] == "batch"
+    with pytest.raises(WorkerTicketError, match="claims"):
+        verify_worker_ticket(ticket, **arguments, now=1_900_000_000)
+
+
+def test_ticket_envelope_can_be_verified_before_form_binding():
+    ticket = create_worker_ticket(
+        secret="secret",
+        worker_id="worker-1",
+        session_id="session-1",
+        model_id="org/model",
+        purpose="batch",
+        expires_at=2_000_000_000,
+    )
+    claims = verify_worker_ticket_envelope(
+        ticket,
+        secret="secret",
+        worker_id="worker-1",
+        purpose="batch",
+        now=1_900_000_000,
+    )
+    assert claims["sid"] == "session-1"
+    assert claims["mid"] == "org/model"
 
 
 def test_verifies_control_plane_golden_ticket():

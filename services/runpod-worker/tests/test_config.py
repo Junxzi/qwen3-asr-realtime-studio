@@ -74,6 +74,12 @@ def test_stream_safety_limits_are_validated(monkeypatch):
         Settings.from_env()
 
 
+def test_diarizer_chunks_must_stay_below_sidecar_limit(monkeypatch):
+    monkeypatch.setenv("DIARIZER_MAX_CHUNK_SECONDS", "2")
+    with pytest.raises(ValueError, match="less than 2 seconds"):
+        Settings.from_env()
+
+
 def test_worker_identity_has_no_shared_fallback(monkeypatch):
     monkeypatch.delenv("WORKER_ID", raising=False)
     monkeypatch.delenv("RUNPOD_POD_ID", raising=False)

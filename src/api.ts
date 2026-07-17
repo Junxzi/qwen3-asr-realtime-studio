@@ -4,6 +4,7 @@ import type {
   ControlStatus,
   InferenceAssignment,
   PersistUtteranceInput,
+  ProcessingMode,
   TranscriptSource,
   TranscriptUtterance,
   TranscriptionDetail,
@@ -78,7 +79,9 @@ export const api = {
   },
   createTranscription: (input: {
     source: TranscriptSource;
-    model_id: string;
+    processing_mode: ProcessingMode;
+    model_id?: string;
+    final_model_id?: string | null;
     catalog_revision: string;
   }) => request<TranscriptionSession>("/api/transcriptions", {
     method: "POST",
@@ -90,22 +93,33 @@ export const api = {
       body: JSON.stringify({ purpose }),
       signal,
     }),
-  assignment: (id: string, signal?: AbortSignal) =>
-    request<InferenceAssignment>(`/api/transcriptions/${encodeURIComponent(id)}/assignment`, { signal }),
-  heartbeatAssignment: (id: string, signal?: AbortSignal) =>
-    request<{ status: "active"; lease_expires_at: string }>(
+  assignment: (id: string, purpose?: AssignmentPurpose, signal?: AbortSignal) => {
+    const query = purpose ? `?purpose=${encodeURIComponent(purpose)}` : "";
+    return request<InferenceAssignment>(`/api/transcriptions/${encodeURIComponent(id)}/assignment${query}`, { signal });
+  },
+  heartbeatAssignment: (id: string, purpose?: AssignmentPurpose, signal?: AbortSignal) =>
+    request<{
+      status: "active";
+      lease_expires_at: string;
+      assignments?: Array<{
+        purpose: AssignmentPurpose;
+        status: "active";
+        lease_expires_at: string;
+      }>;
+    }>(
       `/api/transcriptions/${encodeURIComponent(id)}/assignment/heartbeat`,
-      { method: "POST", body: "{}", signal },
+      { method: "POST", body: JSON.stringify(purpose ? { purpose } : {}), signal },
     ),
   transcription: (id: string) => request<TranscriptionDetail>(`/api/transcriptions/${encodeURIComponent(id)}`),
   renameTranscription: (id: string, title: string) => request<TranscriptionSession>(`/api/transcriptions/${encodeURIComponent(id)}`, {
     method: "PATCH",
     body: JSON.stringify({ title }),
   }),
-  saveUtterance: (sessionId: string, utteranceId: string, input: PersistUtteranceInput) =>
+  saveUtterance: (sessionId: string, utteranceId: string, input: PersistUtteranceInput, signal?: AbortSignal) =>
     request<TranscriptUtterance>(`/api/transcriptions/${encodeURIComponent(sessionId)}/utterances/${encodeURIComponent(utteranceId)}`, {
       method: "PUT",
       body: JSON.stringify(input),
+      signal,
     }),
   completeTranscription: (
     id: string,

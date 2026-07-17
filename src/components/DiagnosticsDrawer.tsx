@@ -1,22 +1,26 @@
 import { RefreshCw } from "lucide-react";
 import { assignmentMessage } from "@/assignment";
+import { PipelineFlow } from "@/components/PipelineFlow";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { formatClock } from "@/lib/format";
-import type { AsrModel, ControlStatus, InferenceAssignment, TranscriptionMetrics } from "@/types";
+import { pipelineDetailLabel, pipelineStatusLabel, type PipelineState } from "@/pipeline";
+import type { AsrModel, ControlStatus, InferenceAssignment, ProcessingProfile, TranscriptionMetrics } from "@/types";
 
 interface DiagnosticsDrawerProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   status?: ControlStatus;
   statusError?: string;
-  assignment?: InferenceAssignment | null;
+  assignments: InferenceAssignment[];
   connection: "disconnected" | "connecting" | "connected" | "error";
   elapsedMs: number;
   metrics: TranscriptionMetrics;
-  events: string[];
+  pipeline: PipelineState;
   pendingSaves: number;
   model?: AsrModel;
+  processingProfile?: ProcessingProfile;
+  live: boolean;
   onRefresh: () => void;
 }
 
@@ -42,25 +46,29 @@ export function DiagnosticsDrawer({
   onOpenChange,
   status,
   statusError,
-  assignment,
+  assignments,
   connection,
   elapsedMs,
   metrics,
-  events,
+  pipeline,
   pendingSaves,
   model,
+  processingProfile,
+  live,
   onRefresh,
 }: DiagnosticsDrawerProps) {
   const connected = connection === "connected";
-  const gpu = status?.pod?.gpu;
+  const assignment = assignments[0];
   const assignedWorker = assignment?.worker;
   const health = assignedWorker?.health || status?.service.health;
-  const assignedGpu = assignedWorker?.gpu;
-  const gpuName = assignedWorker?.gpu_type || health?.accelerator || gpu?.displayName || gpu?.id || "—";
-  const workerRunning = ["ready", "busy", "running"].includes(assignedWorker?.status?.toLowerCase() || "");
-  const gpuRunning = assignedWorker ? workerRunning : status?.pod?.desiredStatus === "RUNNING";
-  const telemetryMatchesWorker = Boolean(assignedWorker?.health) || !assignedWorker || assignedWorker.pod_id === status?.pod?.id;
   const pool = status?.pool;
+  const batchMode = processingProfile?.id === "batch";
+  const connectionLabel = batchMode ? "Batch API" : "WebSocket";
+  const connectionState = batchMode
+    ? connection === "connecting" ? "通信中"
+      : connection === "connected" ? "応答済み"
+        : connection === "error" ? "エラー" : "未接続"
+    : connected ? "接続中" : "未接続";
   return (
     <Sheet open={open} onOpenChange={onOpenChange} modal={false}>
       <SheetContent
@@ -80,38 +88,61 @@ export function DiagnosticsDrawer({
           </Button>
         </SheetHeader>
 
+        <PipelineFlow profile={processingProfile} state={pipeline} live={live} />
+
         <section className="diagnostic-section">
           <h2>接続 <span>(Connection)</span></h2>
           <dl>
-            <div><dt>WebSocket</dt><dd className={connected ? "metric-success" : ""}><i />{connected ? "接続中" : "未接続"}</dd></div>
+            <div><dt>{connectionLabel}</dt><dd className={connected ? "metric-success" : ""}><i />{connectionState}</dd></div>
             <div><dt>接続時間</dt><dd>{formatClock(elapsedMs)}</dd></div>
-            <div><dt>割り当て</dt><dd>{assignment ? assignmentMessage(assignment, model?.display_name) : "未割り当て"}</dd></div>
+            <div>
+              <dt>割り当て</dt>
+              <dd>{assignments.length
+                ? assignments.map((item) => assignmentMessage(item)).join(" / ")
+                : "未割り当て"}</dd>
+            </div>
             <div><dt>保存待ち</dt><dd>{pendingSaves}件</dd></div>
           </dl>
         </section>
 
         <section className="diagnostic-section">
           <h2>割り当てWorker <span>(Assigned worker)</span></h2>
-          <dl>
-            <div>
-              <dt>状態</dt>
-              <dd className={gpuRunning ? "metric-success" : ""}>
-                <i />{assignedWorker?.status || assignment?.status || "未割り当て"}
-              </dd>
-            </div>
-            <div><dt>Worker ID</dt><dd title={assignedWorker?.id}>{assignedWorker?.id || "—"}</dd></div>
-            <div><dt>RunPod ID</dt><dd title={assignedWorker?.pod_id}>{assignedWorker?.pod_id || "—"}</dd></div>
-            <div><dt>Worker名</dt><dd title={assignedWorker?.name}>{assignedWorker?.name || "—"}</dd></div>
-            <div><dt>GPU構成</dt><dd title={gpuName}>{gpuName}</dd></div>
-            <div><dt>台数</dt><dd>{typeof assignedGpu?.count === "number" ? `${assignedGpu.count}基` : telemetryMatchesWorker && gpu?.count ? `${gpu.count}基` : "—"}</dd></div>
-            <div><dt>要求モデル</dt><dd title={assignment?.model_id}>{assignment?.model_id || model?.id || "—"}</dd></div>
-            <div><dt>読込モデル</dt><dd title={assignedWorker?.loaded_model_id}>{assignedWorker?.loaded_model_id || "—"}</dd></div>
-            <div><dt>使用率</dt><dd>{telemetryMatchesWorker ? metric(health?.gpu_utilization_percent, "%") : "—"}</dd></div>
-            <div><dt>VRAM</dt><dd>{telemetryMatchesWorker ? gpuMemory(health?.gpu_memory_used_mb, health?.gpu_memory_total_mb) : "—"}</dd></div>
-            <div><dt>温度</dt><dd>{telemetryMatchesWorker ? metric(health?.gpu_temperature_c, "°C") : "—"}</dd></div>
-            <div><dt>消費電力</dt><dd>{telemetryMatchesWorker ? metric(health?.gpu_power_w, "W") : "—"}</dd></div>
-            <div><dt>時間単価</dt><dd>{telemetryMatchesWorker ? hourlyCost(status?.pod?.costPerHr) : "—"}</dd></div>
-          </dl>
+          {assignments.length ? assignments.map((item) => {
+            const worker = item.worker;
+            const workerHealth = worker?.health || (worker?.pod_id === status?.pod?.id ? status?.service.health : undefined);
+            const assignmentGpu = worker?.gpu;
+            const assignmentGpuName = worker?.gpu_type
+              || workerHealth?.accelerator
+              || assignmentGpu?.displayName
+              || assignmentGpu?.id
+              || "—";
+            const running = ["ready", "busy", "running"].includes(worker?.status?.toLowerCase() || "")
+              || item.status === "ready"
+              || item.status === "active";
+            const role = item.purpose === "realtime"
+              ? "Context / Streaming"
+              : processingProfile?.id === "hybrid" ? "高精度 Finalizer" : "高精度ファイル";
+            return (
+              <div className="diagnostic-worker" key={item.id}>
+                <h3>{role}</h3>
+                <dl>
+                  <div><dt>状態</dt><dd className={running ? "metric-success" : ""}><i />{worker?.status || item.status}</dd></div>
+                  <div><dt>Worker ID</dt><dd title={worker?.id}>{worker?.id || "—"}</dd></div>
+                  <div><dt>RunPod ID</dt><dd title={worker?.pod_id}>{worker?.pod_id || "—"}</dd></div>
+                  <div><dt>Worker名</dt><dd title={worker?.name}>{worker?.name || "—"}</dd></div>
+                  <div><dt>GPU構成</dt><dd title={assignmentGpuName}>{assignmentGpuName}</dd></div>
+                  <div><dt>台数</dt><dd>{typeof assignmentGpu?.count === "number" ? `${assignmentGpu.count}基` : "—"}</dd></div>
+                  <div><dt>要求モデル</dt><dd title={item.model_id}>{item.model_id}</dd></div>
+                  <div><dt>読込モデル</dt><dd title={worker?.loaded_model_id}>{worker?.loaded_model_id || "—"}</dd></div>
+                  <div><dt>使用率</dt><dd>{metric(workerHealth?.gpu_utilization_percent, "%")}</dd></div>
+                  <div><dt>VRAM</dt><dd>{gpuMemory(workerHealth?.gpu_memory_used_mb, workerHealth?.gpu_memory_total_mb)}</dd></div>
+                  <div><dt>温度</dt><dd>{metric(workerHealth?.gpu_temperature_c, "°C")}</dd></div>
+                  <div><dt>消費電力</dt><dd>{metric(workerHealth?.gpu_power_w, "W")}</dd></div>
+                  <div><dt>時間単価</dt><dd>{worker?.pod_id === status?.pod?.id ? hourlyCost(status?.pod?.costPerHr) : "—"}</dd></div>
+                </dl>
+              </div>
+            );
+          }) : <p>GPUはまだ割り当てられていません。</p>}
         </section>
 
         <section className="diagnostic-section">
@@ -157,18 +188,25 @@ export function DiagnosticsDrawer({
 
         <section className="diagnostic-section diagnostic-events">
           <h2>イベント <span>(Events)</span></h2>
-          {events.length ? (
+          {live && pipeline.log.length ? (
             <ol>
-              {events.map((event, index) => (
-                <li key={`${event}-${index}`}>
-                  <i className={event.includes("失敗") || event.includes("エラー") ? "event-warning" : ""} />
-                  <time>{new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time>
-                  <span>{event}</span>
-                </li>
-              ))}
+              {pipeline.log.map((event, index) => {
+                const node = processingProfile?.nodes.find((candidate) => candidate.id === event.stage);
+                const detail = pipelineDetailLabel(event.detail_code);
+                const warning = event.status === "failed" || event.status === "fallback";
+                return (
+                  <li key={`${event.source}-${event.seq ?? "local"}-${event.received_at}-${index}`}>
+                    <i className={warning ? "event-warning" : ""} />
+                    <time dateTime={event.received_at}>
+                      {new Date(event.received_at).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                    </time>
+                    <span>{node?.label || "処理"} · {detail || pipelineStatusLabel(event.status)}</span>
+                  </li>
+                );
+              })}
             </ol>
           ) : (
-            <p>保存済み履歴ではライブイベントを保持していません。</p>
+            <p>{live ? "実行イベントを待っています。" : "保存済み履歴ではライブイベントを保持していません。"}</p>
           )}
         </section>
 

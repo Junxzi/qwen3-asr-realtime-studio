@@ -47,7 +47,7 @@ export function speakerNumber(speaker?: string) {
 }
 
 export function utteranceOffset(utterance: TranscriptUtterance) {
-  return utterance.words[0]?.start_ms ?? Math.max(0, utterance.audio_end_ms - 1000);
+  return utterance.audio_start_ms;
 }
 
 export function percentile(values: Array<number | null | undefined>, percentileValue = 0.95) {
