@@ -3,8 +3,69 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../../server/app.js";
 import { loadConfig } from "../../server/config.js";
 import { MockRunPodProvider, ReadonlyRunPodProvider } from "../../server/runpod.js";
+import type { PodInfo, WorkerRecord } from "../../server/types.js";
+import type { CreateRunPodInput, RunPodFleetClient, WorkerAdminClient, WorkerProbe } from "../../server/worker-clients.js";
+import { WorkerScheduler } from "../../server/worker-scheduler.js";
+import { MemoryWorkerPoolStore } from "../../server/worker-store.js";
 
 const modelId = "infodeliverailab/qwen3-asr-ja-rlbr-context-fullft";
+const finalModelId = "infodeliverailab/lab_asr_diarization_v1";
+
+class ReadyFleet implements RunPodFleetClient {
+  canMutate = true;
+  canCreate(modelId: string, runtime: "realtime" | "batch") {
+    void modelId;
+    void runtime;
+    return false;
+  }
+  async getPod(podId: string): Promise<PodInfo> { return { id: podId, desiredStatus: "RUNNING" }; }
+  async findPodByWorkerId(workerId: string): Promise<PodInfo | null> {
+    void workerId;
+    return null;
+  }
+  async startPod(podId: string) { void podId; }
+  async stopPod(podId: string) { void podId; }
+  async createPod(input: CreateRunPodInput): Promise<PodInfo> {
+    void input;
+    throw new Error("not supported");
+  }
+}
+
+class BatchProvisioningFleet extends ReadyFleet {
+  findCalls: string[] = [];
+  createCalls: CreateRunPodInput[] = [];
+
+  override canCreate(candidateModelId: string, runtime: "realtime" | "batch") {
+    return candidateModelId === finalModelId && runtime === "batch";
+  }
+
+  override async findPodByWorkerId(workerId: string): Promise<PodInfo | null> {
+    this.findCalls.push(workerId);
+    return null;
+  }
+
+  override async createPod(input: CreateRunPodInput): Promise<PodInfo> {
+    this.createCalls.push(input);
+    return { id: "pod-batch-created", desiredStatus: "RUNNING" };
+  }
+}
+
+class ReadyAdmin implements WorkerAdminClient {
+  async probe(worker: WorkerRecord): Promise<WorkerProbe> {
+    return {
+      ready: true,
+      workerId: worker.id,
+      modelId: worker.modelId,
+      health: {
+        worker_id: worker.id,
+        model_id: worker.modelId,
+        accelerator: "NVIDIA A100 80GB",
+        catalog_revision: worker.runtime === "realtime" ? "realtime-catalog" : "batch-must-not-apply",
+      },
+    };
+  }
+  async drain(worker: WorkerRecord) { void worker; }
+}
 
 describe("worker pool API", () => {
   let clock: number;
@@ -127,6 +188,11 @@ describe("worker pool API", () => {
     expect(heartbeat.body.data).toEqual({
       status: "active",
       lease_expires_at: new Date(clock + 900_000).toISOString(),
+      assignments: [{
+        purpose: "realtime",
+        status: "active",
+        lease_expires_at: new Date(clock + 900_000).toISOString(),
+      }],
     });
 
     await agent.post(`/api/transcriptions/${id}/complete`).set("origin", "http://localhost").send({
@@ -140,6 +206,190 @@ describe("worker pool API", () => {
       .expect(409);
     expect(late.body.error.code).toBe("transcription_not_active");
     expect((await agent.get(`/api/transcriptions/${id}/assignment`).expect(200)).body.data.status).toBe("released");
+  });
+
+  it("allocates both hybrid purposes idempotently, returns purpose-specific URLs, and releases both", async () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      RUNPOD_PROVIDER: "mock",
+      CONTROL_PASSWORD: "test-password",
+      SESSION_SECRET: "test-session-secret-at-least-32-characters",
+      WORKER_TICKET_SECRET: "worker-ticket-secret-at-least-32-characters",
+      ALLOWED_ORIGIN: "http://localhost",
+      RUNPOD_POOL_MAX_WORKERS: "2",
+      RUNPOD_WORKERS_JSON: JSON.stringify([
+        {
+          id: "hybrid-realtime",
+          pod_id: "pod-hybrid-realtime",
+          name: "Hybrid realtime worker",
+          service_url: "https://pod-hybrid-realtime-8000.proxy.runpod.net",
+          model_id: modelId,
+          runtime: "realtime",
+          max_sessions: 1,
+          enabled: true,
+        },
+        {
+          id: "hybrid-batch",
+          pod_id: "pod-hybrid-batch",
+          name: "Hybrid finalizer worker",
+          service_url: "https://pod-hybrid-batch-8000.proxy.runpod.net",
+          model_id: finalModelId,
+          runtime: "batch",
+          max_sessions: 1,
+          enabled: true,
+        },
+      ]),
+    });
+    const scheduler = new WorkerScheduler(
+      config,
+      new MemoryWorkerPoolStore(),
+      new ReadyFleet(),
+      new ReadyAdmin(),
+      () => clock,
+    );
+    const hybridApp = createApp(config, new MockRunPodProvider(config, () => clock), {
+      serveStatic: false,
+      now: () => clock,
+      scheduler,
+    });
+    const agent = request.agent(hybridApp);
+    await agent.post("/api/session/login").set("origin", "http://localhost")
+      .send({ password: "test-password" }).expect(200);
+    const created = await agent.post("/api/transcriptions").set("origin", "http://localhost").send({
+      source: "microphone",
+      processing_mode: "hybrid",
+    }).expect(201);
+    const id = created.body.data.id as string;
+
+    const realtime = await agent.post(`/api/transcriptions/${id}/assignment`)
+      .set("origin", "http://localhost").send({ purpose: "realtime" }).expect(200);
+    const batch = await agent.post(`/api/transcriptions/${id}/assignment`)
+      .set("origin", "http://localhost").send({ purpose: "batch" }).expect(200);
+    expect(realtime.body.data).toMatchObject({
+      session_id: id,
+      model_id: modelId,
+      purpose: "realtime",
+      status: "ready",
+      connection: {
+        websocket_url: "wss://pod-hybrid-realtime-8000.proxy.runpod.net/v1/realtime",
+        catalog_revision: "realtime-catalog",
+      },
+    });
+    expect(realtime.body.data.connection.batch_url).toBeUndefined();
+    expect(batch.body.data).toMatchObject({
+      session_id: id,
+      model_id: finalModelId,
+      purpose: "batch",
+      status: "ready",
+      connection: {
+        batch_url: "https://pod-hybrid-batch-8000.proxy.runpod.net/v1/audio/transcriptions",
+        catalog_revision: null,
+      },
+    });
+    expect(batch.body.data.connection.websocket_url).toBeUndefined();
+    expect((await agent.get(`/api/transcriptions/${id}`).expect(200)).body.data.catalog_revision)
+      .toBe("realtime-catalog");
+    expect(batch.body.data.id).not.toBe(realtime.body.data.id);
+
+    const realtimeRetry = await agent.post(`/api/transcriptions/${id}/assignment`)
+      .set("origin", "http://localhost").send({ purpose: "realtime" }).expect(200);
+    const batchRetry = await agent.post(`/api/transcriptions/${id}/assignment`)
+      .set("origin", "http://localhost").send({ purpose: "batch" }).expect(200);
+    expect(realtimeRetry.body.data.id).toBe(realtime.body.data.id);
+    expect(batchRetry.body.data.id).toBe(batch.body.data.id);
+    expect((await agent.get(`/api/transcriptions/${id}/assignment`).query({ purpose: "batch" }).expect(200)).body.data.id)
+      .toBe(batch.body.data.id);
+
+    const realtimeHeartbeat = await agent.post(`/api/transcriptions/${id}/assignment/heartbeat`)
+      .set("origin", "http://localhost").send({ purpose: "realtime" }).expect(200);
+    expect(realtimeHeartbeat.body.data.assignments).toEqual([
+      expect.objectContaining({ purpose: "realtime", status: "active" }),
+    ]);
+    expect((await agent.get(`/api/transcriptions/${id}/assignment`)
+      .query({ purpose: "batch" }).expect(200)).body.data.status).toBe("ready");
+
+    const fallbackHeartbeat = await agent.post(`/api/transcriptions/${id}/assignment/heartbeat`)
+      .set("origin", "http://localhost").send({}).expect(200);
+    expect(fallbackHeartbeat.body.data.assignments).toEqual([
+      expect.objectContaining({ purpose: "realtime", status: "active" }),
+      expect.objectContaining({ purpose: "batch", status: "active" }),
+    ]);
+    expect((await agent.get("/api/workers").expect(200)).body.data).toMatchObject({
+      active_sessions: 1,
+      active_assignments: 2,
+    });
+
+    await agent.post(`/api/transcriptions/${id}/complete`).set("origin", "http://localhost").send({
+      status: "completed",
+      duration_ms: 1_200,
+      metrics: {},
+    }).expect(200);
+    expect((await agent.get(`/api/transcriptions/${id}/assignment`).query({ purpose: "realtime" }).expect(200)).body.data.status)
+      .toBe("released");
+    expect((await agent.get(`/api/transcriptions/${id}/assignment`).query({ purpose: "batch" }).expect(200)).body.data.status)
+      .toBe("released");
+    expect((await agent.get("/api/workers").expect(200)).body.data.active_sessions).toBe(0);
+  });
+
+  it("returns a fail-loud API error before dynamically provisioning batch without a Network Volume", async () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      RUNPOD_PROVIDER: "mock",
+      CONTROL_PASSWORD: "test-password",
+      SESSION_SECRET: "test-session-secret-at-least-32-characters",
+      WORKER_TICKET_SECRET: "worker-ticket-secret-at-least-32-characters",
+      ALLOWED_ORIGIN: "http://localhost",
+      RUNPOD_POOL_MAX_WORKERS: "1",
+      RUNPOD_WORKERS_JSON: "[]",
+      RUNPOD_MODEL_TEMPLATES_JSON: JSON.stringify([{
+        model_id: finalModelId,
+        runtime: "batch",
+        template_id: "template-batch",
+        max_sessions: 1,
+      }]),
+    });
+    const fleet = new BatchProvisioningFleet();
+    const scheduler = new WorkerScheduler(
+      config,
+      new MemoryWorkerPoolStore(),
+      fleet,
+      new ReadyAdmin(),
+      () => clock,
+    );
+    const dynamicApp = createApp(config, new MockRunPodProvider(config, () => clock), {
+      serveStatic: false,
+      now: () => clock,
+      scheduler,
+    });
+    const agent = request.agent(dynamicApp);
+    await agent.post("/api/session/login").set("origin", "http://localhost")
+      .send({ password: "test-password" }).expect(200);
+    const created = await agent.post("/api/transcriptions").set("origin", "http://localhost").send({
+      source: "file",
+      processing_mode: "batch",
+    }).expect(201);
+
+    const blocked = await agent.post(`/api/transcriptions/${created.body.data.id}/assignment`)
+      .set("origin", "http://localhost")
+      .send({ purpose: "batch" })
+      .expect(503);
+
+    expect(blocked.body.error).toMatchObject({
+      code: "runpod_network_volume_required",
+      message: expect.stringContaining("RUNPOD_NETWORK_VOLUME_ID"),
+    });
+    expect(fleet.findCalls).toEqual([]);
+    expect(fleet.createCalls).toEqual([]);
+    expect((await agent.get("/api/workers").expect(200)).body.data.total_workers).toBe(0);
+  });
+
+  it("rejects an assignment purpose that the processing mode does not use", async () => {
+    const { agent, id } = await loginAndCreate();
+    const mismatch = await agent.post(`/api/transcriptions/${id}/assignment`)
+      .set("origin", "http://localhost")
+      .send({ purpose: "batch" })
+      .expect(409);
+    expect(mismatch.body.error.code).toBe("assignment_purpose_mismatch");
   });
 
   it("assigns an already-running legacy worker in read-only control mode", async () => {

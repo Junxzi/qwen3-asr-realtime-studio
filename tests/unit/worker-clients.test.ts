@@ -88,6 +88,36 @@ describe("RunPod fleet client", () => {
     expect(calls[1].init?.headers).toMatchObject({ authorization: "Bearer runpod-api-key" });
   });
 
+  it("never calls the RunPod create API for a batch template without a Network Volume", async () => {
+    let calls = 0;
+    const config = loadConfig({
+      NODE_ENV: "test",
+      RUNPOD_PROVIDER: "mock",
+      RUNPOD_WORKERS_JSON: "[]",
+      RUNPOD_MODEL_TEMPLATES_JSON: JSON.stringify([{
+        model_id: "infodeliverailab/lab_asr_diarization_v1",
+        runtime: "batch",
+        template_id: "template-batch",
+        max_sessions: 1,
+      }]),
+    });
+    const client = new LiveRunPodFleetClient(config, (async () => {
+      calls += 1;
+      return jsonResponse({ id: "must-not-exist" });
+    }) as typeof fetch);
+
+    await expect(client.createPod({
+      name: "batch-worker",
+      workerId: "batch-worker-1",
+      modelId: "infodeliverailab/lab_asr_diarization_v1",
+      runtime: "batch",
+    })).rejects.toMatchObject({
+      code: "runpod_network_volume_required",
+      status: 503,
+    });
+    expect(calls).toBe(0);
+  });
+
   it("finds exactly one active Pod by the WORKER_ID environment value", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     const fetcher = async (input: string | URL | Request, init?: RequestInit) => {

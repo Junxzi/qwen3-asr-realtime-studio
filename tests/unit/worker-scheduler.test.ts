@@ -7,6 +7,7 @@ import { WorkerScheduler } from "../../server/worker-scheduler.js";
 import { MemoryWorkerPoolStore } from "../../server/worker-store.js";
 
 const modelId = "infodeliverailab/qwen3-asr-ja-rlbr-context-fullft";
+const finalModelId = "infodeliverailab/lab_asr_diarization_v1";
 
 function createConfig(maxSessions = 1, workerCount = 2) {
   return loadConfig({
@@ -27,12 +28,14 @@ function createConfig(maxSessions = 1, workerCount = 2) {
   });
 }
 
-function createProvisioningConfig(timeoutSeconds = 10) {
+function createProvisioningConfig(timeoutSeconds = 10, autoStopIdle = false) {
   return loadConfig({
     NODE_ENV: "test",
     RUNPOD_PROVIDER: "mock",
     WORKER_TICKET_SECRET: "worker-ticket-secret-at-least-32-characters",
     RUNPOD_POOL_MAX_WORKERS: "1",
+    RUNPOD_NETWORK_VOLUME_ID: "shared-model-volume",
+    RUNPOD_AUTO_STOP_IDLE: autoStopIdle ? "true" : "false",
     WORKER_PROVISION_TIMEOUT_SECONDS: String(timeoutSeconds),
     RUNPOD_WORKERS_JSON: JSON.stringify([{
       id: "static-disabled",
@@ -50,6 +53,53 @@ function createProvisioningConfig(timeoutSeconds = 10) {
       template_id: "template-realtime",
       max_sessions: 32,
     }]),
+  });
+}
+
+function createBatchProvisioningConfig() {
+  return loadConfig({
+    NODE_ENV: "test",
+    RUNPOD_PROVIDER: "mock",
+    WORKER_TICKET_SECRET: "worker-ticket-secret-at-least-32-characters",
+    RUNPOD_POOL_MAX_WORKERS: "1",
+    RUNPOD_WORKERS_JSON: "[]",
+    RUNPOD_MODEL_TEMPLATES_JSON: JSON.stringify([{
+      model_id: finalModelId,
+      runtime: "batch",
+      template_id: "template-batch",
+      max_sessions: 1,
+    }]),
+  });
+}
+
+function createHybridConfig() {
+  return loadConfig({
+    NODE_ENV: "test",
+    RUNPOD_PROVIDER: "mock",
+    WORKER_TICKET_SECRET: "worker-ticket-secret-at-least-32-characters",
+    RUNPOD_POOL_MAX_WORKERS: "2",
+    RUNPOD_WORKERS_JSON: JSON.stringify([
+      {
+        id: "hybrid-realtime",
+        pod_id: "pod-hybrid-realtime",
+        name: "Hybrid realtime worker",
+        service_url: "https://pod-hybrid-realtime-8000.proxy.runpod.net",
+        model_id: modelId,
+        runtime: "realtime",
+        max_sessions: 1,
+        enabled: true,
+      },
+      {
+        id: "hybrid-batch",
+        pod_id: "pod-hybrid-batch",
+        name: "Hybrid finalizer worker",
+        service_url: "https://pod-hybrid-batch-8000.proxy.runpod.net",
+        model_id: finalModelId,
+        runtime: "batch",
+        max_sessions: 1,
+        enabled: true,
+      },
+    ]),
   });
 }
 
@@ -144,8 +194,54 @@ class BarrierStore extends MemoryWorkerPoolStore {
   }
 }
 
+class ReleaseBeforeFirstBindingStore extends MemoryWorkerPoolStore {
+  private released = false;
+
+  constructor(private sessionId: string) {
+    super();
+  }
+
+  override async markProvisioning(
+    assignmentId: string,
+    workerId: string | null,
+    message: string,
+    now: Date,
+    leaseSeconds: number,
+  ) {
+    if (!this.released) {
+      this.released = true;
+      await super.release(this.sessionId, now);
+    }
+    return await super.markProvisioning(assignmentId, workerId, message, now, leaseSeconds);
+  }
+}
+
+class LateBindingReleaseStore extends MemoryWorkerPoolStore {
+  releaseEntered = createGate();
+  allowRelease = createGate();
+
+  override async release(sessionId: string, now: Date) {
+    this.releaseEntered.release();
+    await this.allowRelease.promise;
+    return await super.release(sessionId, now);
+  }
+}
+
 class RejectingFinalizeStore extends MemoryWorkerPoolStore {
   override async finalizeProvisioningWorker() { return null; }
+}
+
+class VanishingWorkerStore extends MemoryWorkerPoolStore {
+  vanishedWorkerId: string | null = null;
+  readsBeforeVanish = 0;
+
+  override async getWorker(id: string) {
+    if (id === this.vanishedWorkerId) {
+      if (this.readsBeforeVanish <= 0) return null;
+      this.readsBeforeVanish -= 1;
+    }
+    return await super.getWorker(id);
+  }
 }
 
 class FakeAdmin implements WorkerAdminClient {
@@ -164,6 +260,22 @@ class FakeAdmin implements WorkerAdminClient {
   async loadModel(worker: WorkerRecord, nextModelId: string) { this.loadCalls.push({ workerId: worker.id, modelId: nextModelId }); }
   async unloadModel() {}
   async drain(worker: WorkerRecord) { this.drainCalls.push(worker.id); }
+}
+
+class SelectiveAdmin extends FakeAdmin {
+  unavailableWorkerId: string | null = null;
+
+  override async probe(worker: WorkerRecord): Promise<WorkerProbe> {
+    if (worker.id !== this.unavailableWorkerId) return await super.probe(worker);
+    this.probeCalls += 1;
+    return {
+      ready: false,
+      workerId: worker.id,
+      modelId: worker.modelId,
+      message: "worker unavailable",
+      health: { worker_id: worker.id, model_id: worker.modelId, message: "worker unavailable" },
+    };
+  }
 }
 
 class BlockingAdmin extends FakeAdmin {
@@ -214,7 +326,91 @@ describe("worker scheduler", () => {
     expect(retried.id).toBe(first.id);
     expect(first.workerId).toBe("worker-1");
     expect(second.workerId).toBe("worker-2");
-    expect((await scheduler.diagnostics()).active_sessions).toBe(2);
+    expect(await scheduler.diagnostics()).toMatchObject({
+      active_sessions: 2,
+      active_assignments: 2,
+    });
+  });
+
+  it("isolates hybrid purposes when one assigned worker becomes unavailable", async () => {
+    const config = createHybridConfig();
+    const store = new MemoryWorkerPoolStore();
+    const admin = new SelectiveAdmin();
+    const scheduler = new WorkerScheduler(config, store, new FakeFleet(), admin, () => 10_000);
+    const sessionId = "00000000-0000-4000-8000-000000000091";
+
+    const realtime = await scheduler.request({ sessionId, modelId, purpose: "realtime" });
+    const batch = await scheduler.request({ sessionId, modelId: finalModelId, purpose: "batch" });
+    expect(realtime).toMatchObject({ status: "ready", workerId: "hybrid-realtime" });
+    expect(batch).toMatchObject({ status: "ready", workerId: "hybrid-batch" });
+
+    admin.unavailableWorkerId = "hybrid-realtime";
+    await expect(scheduler.request({ sessionId, modelId, purpose: "realtime" }))
+      .resolves.toMatchObject({ status: "provisioning", workerId: null });
+
+    expect(await scheduler.observe(sessionId, "batch")).toMatchObject({
+      id: batch.id,
+      status: "ready",
+      workerId: "hybrid-batch",
+    });
+    expect(await store.getWorker("hybrid-realtime")).toMatchObject({ activeSessions: 0 });
+    expect(await store.getWorker("hybrid-batch")).toMatchObject({ activeSessions: 1 });
+    expect(await scheduler.diagnostics()).toMatchObject({
+      active_sessions: 1,
+      active_assignments: 1,
+    });
+  });
+
+  it("reassigns a live assignment when its worker is lost without leaking capacity", async () => {
+    const config = createConfig(1, 2);
+    const store = new MemoryWorkerPoolStore();
+    const admin = new SelectiveAdmin();
+    const scheduler = new WorkerScheduler(config, store, new FakeFleet(), admin, () => 10_000);
+    const sessionId = "00000000-0000-4000-8000-000000000092";
+    const first = await scheduler.request({ sessionId, modelId, purpose: "realtime" });
+    await scheduler.touch(sessionId, "realtime");
+    expect(first).toMatchObject({ status: "ready", workerId: "worker-1" });
+
+    admin.unavailableWorkerId = "worker-1";
+    const reassigned = await scheduler.request({ sessionId, modelId, purpose: "realtime" });
+
+    expect(reassigned).toMatchObject({
+      id: first.id,
+      status: "ready",
+      workerId: "worker-2",
+    });
+    expect(await store.getWorker("worker-1")).toMatchObject({ status: "unhealthy", activeSessions: 0 });
+    expect(await store.getWorker("worker-2")).toMatchObject({ status: "ready", activeSessions: 1 });
+    expect(await scheduler.response(reassigned)).toMatchObject({
+      worker: { id: "worker-2", active_sessions: 1 },
+      connection: { websocket_url: "wss://pod-2-8000.proxy.runpod.net/v1/realtime" },
+    });
+    expect(await scheduler.diagnostics()).toMatchObject({
+      active_sessions: 1,
+      active_assignments: 1,
+    });
+  });
+
+  it("requeues by the original worker id when reconciliation can no longer read the worker row", async () => {
+    const config = createConfig(1, 2);
+    const store = new VanishingWorkerStore();
+    const scheduler = new WorkerScheduler(config, store, new FakeFleet(), new FakeAdmin(), () => 10_000);
+    const sessionId = "00000000-0000-4000-8000-000000000093";
+    const first = await scheduler.request({ sessionId, modelId, purpose: "realtime" });
+    expect(first).toMatchObject({ status: "ready", workerId: "worker-1" });
+
+    store.vanishedWorkerId = "worker-1";
+    store.readsBeforeVanish = 1;
+    const reassigned = await scheduler.request({ sessionId, modelId, purpose: "realtime" });
+
+    expect(reassigned).toMatchObject({
+      id: first.id,
+      status: "ready",
+      workerId: "worker-2",
+    });
+    store.vanishedWorkerId = null;
+    expect(await store.getWorker("worker-1")).toMatchObject({ activeSessions: 0 });
+    expect(await store.getWorker("worker-2")).toMatchObject({ activeSessions: 1 });
   });
 
   it("enforces hard capacity and releases capacity idempotently", async () => {
@@ -286,6 +482,26 @@ describe("worker scheduler", () => {
     expect(admin.drainCalls).toEqual(["worker-1"]);
     expect(fleet.stopCalls).toEqual(["pod-1"]);
     expect(await store.getWorker("worker-1")).toMatchObject({ enabled: true, status: "stopped" });
+  });
+
+  it("fails before discovery or creation when a dynamic batch template has no Network Volume", async () => {
+    const config = createBatchProvisioningConfig();
+    const store = new MemoryWorkerPoolStore();
+    const fleet = new DiscoveringFleet();
+    const scheduler = new WorkerScheduler(config, store, fleet, new FakeAdmin(), () => 10_000);
+
+    await expect(scheduler.request({
+      sessionId: "00000000-0000-4000-8000-000000000091",
+      modelId: finalModelId,
+      purpose: "batch",
+    })).rejects.toMatchObject({
+      code: "runpod_network_volume_required",
+      status: 503,
+    } satisfies Partial<ProviderError>);
+
+    expect(fleet.findCalls).toEqual([]);
+    expect(fleet.createCalls).toEqual([]);
+    expect(await store.listWorkers()).toEqual([]);
   });
 
   it("creates only one RunPod Pod for concurrent retries of the same assignment", async () => {
@@ -463,7 +679,7 @@ describe("worker scheduler", () => {
 
   it("stops a delayed Pod discovered for a released recovery placeholder", async () => {
     let now = 0;
-    const config = createProvisioningConfig(10);
+    const config = createProvisioningConfig(10, true);
     const store = new MemoryWorkerPoolStore();
     const fleet = new DiscoveringFleet();
     fleet.discoveries.push(null, null, {
@@ -553,7 +769,7 @@ describe("worker scheduler", () => {
   });
 
   it("provisions one cold Pod for concurrent sessions with the same model and runtime", async () => {
-    const config = createProvisioningConfig();
+    const config = createProvisioningConfig(10);
     const store = new BarrierStore();
     const fleet = new CreatingFleet();
     const scheduler = new WorkerScheduler(config, store, fleet, new FakeAdmin(), () => 10_000);
@@ -577,8 +793,31 @@ describe("worker scheduler", () => {
     expect(second.status).toBe("provisioning");
   });
 
-  it("does not assign a session after an idle worker has been claimed for draining", async () => {
+  it("leaves an idle dynamic Pod running when automatic stop is not enabled", async () => {
     const config = createProvisioningConfig();
+    const store = new MemoryWorkerPoolStore();
+    const fleet = new FakeFleet();
+    const scheduler = new WorkerScheduler(config, store, fleet, new FakeAdmin(), () => 10_000);
+    await store.upsertWorker({
+      ...provisioningWorker("dynamic-worker"),
+      podId: "pod-dynamic",
+      serviceUrl: "https://pod-dynamic-8000.proxy.runpod.net",
+    }, "ready", new Date(10_000));
+    const sessionId = "00000000-0000-4000-8000-000000000020";
+    await scheduler.request({ sessionId, modelId, purpose: "realtime" });
+
+    await scheduler.release(sessionId);
+
+    expect(fleet.stopCalls).toEqual([]);
+    expect(await store.getWorker("dynamic-worker")).toMatchObject({
+      activeSessions: 0,
+      enabled: true,
+      status: "ready",
+    });
+  });
+
+  it("does not assign a session after an idle worker has been claimed for draining", async () => {
+    const config = createProvisioningConfig(10, true);
     const store = new MemoryWorkerPoolStore();
     const fleet = new FakeFleet();
     const admin = new BlockingAdmin();
@@ -631,7 +870,7 @@ describe("worker scheduler", () => {
 
   it("adopts and stops an unassigned orphan before the provisioning reaper can forget it", async () => {
     let now = 0;
-    const config = createProvisioningConfig(10);
+    const config = createProvisioningConfig(10, true);
     const store = new MemoryWorkerPoolStore();
     await store.claimProvisioningWorker(provisioningWorker(), 1, new Date(now));
     const fleet = new DiscoveringFleet();
@@ -750,5 +989,97 @@ describe("worker scheduler", () => {
     expect(fleet.stopCalls).toEqual(["pod-created"]);
     const dynamicWorker = (await store.listWorkers()).find((worker) => worker.origin === "dynamic");
     expect(dynamicWorker).toMatchObject({ enabled: false, status: "terminated", podId: "" });
+  });
+
+  it.each([
+    [true, ["pod-created"]],
+    [false, []],
+  ])(
+    "handles a Pod whose create response arrives after session release (auto-stop=%s)",
+    async (autoStopIdle, expectedStops) => {
+      const config = createProvisioningConfig(10, autoStopIdle);
+      const store = new MemoryWorkerPoolStore();
+      const fleet = new CreatingFleet();
+      fleet.allowCreate = createGate();
+      const scheduler = new WorkerScheduler(config, store, fleet, new FakeAdmin(), () => 0);
+      const sessionId = autoStopIdle
+        ? "00000000-0000-4000-8000-000000000041"
+        : "00000000-0000-4000-8000-000000000042";
+      const pending = scheduler.request({ sessionId, modelId, purpose: "realtime" });
+      await fleet.createEntered.promise;
+
+      await scheduler.release(sessionId);
+      fleet.allowCreate.release();
+      const assignment = await pending;
+
+      expect(assignment.status).toBe("released");
+      expect(fleet.stopCalls).toEqual(expectedStops);
+      const dynamicWorker = (await store.listWorkers()).find((worker) => worker.origin === "dynamic");
+      expect(dynamicWorker).toMatchObject({
+        podId: "pod-created",
+        status: autoStopIdle ? "stopped" : "starting",
+        enabled: true,
+      });
+    },
+  );
+
+  it("does not call RunPod after an assignment is released before cold provisioning binds", async () => {
+    const config = createProvisioningConfig();
+    const sessionId = "00000000-0000-4000-8000-000000000043";
+    const store = new ReleaseBeforeFirstBindingStore(sessionId);
+    const fleet = new DiscoveringFleet();
+    const scheduler = new WorkerScheduler(config, store, fleet, new FakeAdmin(), () => 0);
+
+    const assignment = await scheduler.request({ sessionId, modelId, purpose: "realtime" });
+
+    expect(assignment.status).toBe("released");
+    expect(fleet.findCalls).toEqual([]);
+    expect(fleet.createCalls).toEqual([]);
+    expect(fleet.startCalls).toEqual([]);
+    const placeholder = (await store.listWorkers()).find((worker) => worker.origin === "dynamic");
+    expect(placeholder).toMatchObject({
+      podId: "",
+      enabled: false,
+      status: "terminated",
+    });
+  });
+
+  it("uses the release result to stop a worker bound after the pre-release snapshot", async () => {
+    const config = createProvisioningConfig(10, true);
+    const store = new LateBindingReleaseStore();
+    const fleet = new FakeFleet();
+    const scheduler = new WorkerScheduler(config, store, fleet, new FakeAdmin(), () => 0);
+    const sessionId = "00000000-0000-4000-8000-000000000044";
+    const claim = await store.claimProvisioningWorker({
+      ...provisioningWorker("late-bound-worker"),
+      podId: "",
+    }, 1, new Date(0));
+    expect(claim?.acquired).toBe(true);
+    await store.finalizeProvisioningWorker("late-bound-worker", {
+      podId: "pod-late-bound",
+      name: "Late bound worker",
+      serviceUrl: "https://pod-late-bound-8000.proxy.runpod.net",
+    }, new Date(0));
+    await store.updateWorker("late-bound-worker", { status: "ready" }, new Date(0));
+    const assignment = await store.createRequestedAssignment({
+      sessionId,
+      modelId,
+      purpose: "realtime",
+      now: new Date(0),
+      leaseSeconds: 900,
+    });
+    const pendingRelease = scheduler.release(sessionId);
+    await store.releaseEntered.promise;
+    await store.reserveReadyWorker(assignment.id, new Date(1), 900);
+
+    store.allowRelease.release();
+    await pendingRelease;
+
+    expect(fleet.stopCalls).toEqual(["pod-late-bound"]);
+    expect(await store.getWorker("late-bound-worker")).toMatchObject({
+      activeSessions: 0,
+      enabled: true,
+      status: "stopped",
+    });
   });
 });

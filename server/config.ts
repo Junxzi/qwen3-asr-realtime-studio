@@ -31,7 +31,8 @@ const schema = z.object({
   RUNPOD_WORKERS_JSON: z.string().default(""),
   RUNPOD_TEMPLATE_ID: z.string().default(""),
   RUNPOD_MODEL_TEMPLATES_JSON: z.string().default(""),
-  RUNPOD_NETWORK_VOLUME_ID: z.string().default(""),
+  RUNPOD_NETWORK_VOLUME_ID: z.string().trim().default(""),
+  RUNPOD_AUTO_STOP_IDLE: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   RUNPOD_POOL_MAX_WORKERS: z.coerce.number().int().positive().max(64).default(4),
   RUNPOD_WORKER_PORT: z.coerce.number().int().positive().max(65535).default(8000),
   RUNPOD_WORKER_ADMIN_SECRET: z.string().default(""),
@@ -55,6 +56,14 @@ const schema = z.object({
 });
 
 export type AppConfig = ReturnType<typeof loadConfig>;
+
+export function modelTemplateRequiresNetworkVolume(template: {
+  modelId: string;
+  runtime: "realtime" | "batch";
+}) {
+  return template.runtime === "batch"
+    || (template.runtime === "realtime" && template.modelId === DEFAULT_ASR_MODEL_ID);
+}
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
   const value = schema.parse(environment);
@@ -176,12 +185,16 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
       maxSessions: defaultTemplateWorker.maxSessions,
     });
   }
+  const templatesRequiringNetworkVolume = [...templateMap.values()]
+    .filter(modelTemplateRequiresNetworkVolume);
   if (
     value.RUNPOD_PROVIDER === "live"
-    && templateMap.has(`realtime:${DEFAULT_ASR_MODEL_ID}`)
+    && templatesRequiringNetworkVolume.length > 0
     && !value.RUNPOD_NETWORK_VOLUME_ID
   ) {
-    throw new Error("RUNPOD_NETWORK_VOLUME_ID is required to provision the Context Full-FT worker and catalog");
+    throw new Error(
+      "RUNPOD_NETWORK_VOLUME_ID is required to provision Context Full-FT or batch template workers",
+    );
   }
   const workerTicketSecret = value.WORKER_TICKET_SECRET || value.SESSION_SECRET;
   if (workers.filter((worker) => worker.enabled).length > value.RUNPOD_POOL_MAX_WORKERS) {
@@ -200,6 +213,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     workers,
     modelTemplates: [...templateMap.values()],
     runpodNetworkVolumeId: value.RUNPOD_NETWORK_VOLUME_ID,
+    autoStopIdleWorkers: value.RUNPOD_AUTO_STOP_IDLE,
     workerPoolMaxWorkers: value.RUNPOD_POOL_MAX_WORKERS,
     workerPort: value.RUNPOD_WORKER_PORT,
     workerAdminSecret: value.RUNPOD_WORKER_ADMIN_SECRET,

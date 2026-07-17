@@ -1,11 +1,13 @@
 import type { Express, RequestHandler } from "express";
 import { z } from "zod";
-import { listAsrModels } from "./asr-models.js";
+import { assignmentForPurpose } from "./processing-modes.js";
 import type { TranscriptionStore } from "./transcriptions.js";
 import type { WorkerScheduler } from "./worker-scheduler.js";
 
 const idSchema = z.string().uuid();
 const assignmentSchema = z.object({ purpose: z.enum(["realtime", "batch"]) }).strict();
+const assignmentQuerySchema = z.object({ purpose: z.enum(["realtime", "batch"]).optional() });
+const heartbeatSchema = z.object({ purpose: z.enum(["realtime", "batch"]).optional() }).strict();
 
 function assignmentStatusCode(status: string) {
   return status === "requested" || status === "provisioning" ? 202 : 200;
@@ -47,8 +49,11 @@ export function registerWorkerRoutes(
         });
         return;
       }
-      const model = listAsrModels().find((candidate) => candidate.id === session.model_id);
-      if (!model || model.runtime !== body.purpose) {
+      const target = assignmentForPurpose(session.processing_mode, body.purpose);
+      const storedModelId = body.purpose === "realtime"
+        ? session.model_id
+        : session.processing_mode === "batch" ? session.model_id : session.final_model_id;
+      if (!target || !storedModelId || target.model_id !== storedModelId) {
         response.status(409).json({
           error: {
             code: "assignment_purpose_mismatch",
@@ -58,9 +63,13 @@ export function registerWorkerRoutes(
         });
         return;
       }
-      const assignment = await scheduler.request({ sessionId: id, modelId: session.model_id, purpose: body.purpose });
+      const assignment = await scheduler.request({ sessionId: id, modelId: target.model_id, purpose: body.purpose });
       const payload = await scheduler.response(assignment);
-      if (payload.connection?.catalog_revision && payload.connection.catalog_revision !== session.catalog_revision) {
+      if (
+        body.purpose === "realtime"
+        && payload.connection?.catalog_revision
+        && payload.connection.catalog_revision !== session.catalog_revision
+      ) {
         await store.setCatalogRevision(id, payload.connection.catalog_revision, new Date(now()));
       }
       response.setHeader("cache-control", "no-store");
@@ -71,6 +80,7 @@ export function registerWorkerRoutes(
   app.get("/api/transcriptions/:id/assignment", authenticated, async (request, response, next) => {
     try {
       const id = idSchema.parse(request.params.id);
+      const query = assignmentQuerySchema.parse(request.query);
       const session = await store.get(id, new Date(now()));
       if (!session) {
         response.status(404).json({
@@ -78,7 +88,7 @@ export function registerWorkerRoutes(
         });
         return;
       }
-      const assignment = await scheduler.observe(id);
+      const assignment = await scheduler.observe(id, query.purpose);
       if (!assignment) {
         response.status(404).json({
           error: { code: "assignment_not_found", message: "この文字起こしのワーカー割当はまだありません", requestId: response.locals.requestId },
@@ -97,6 +107,7 @@ export function registerWorkerRoutes(
     async (request, response, next) => {
       try {
         const id = idSchema.parse(request.params.id);
+        const body = heartbeatSchema.parse(request.body ?? {});
         const session = await store.get(id, new Date(now()));
         if (!session) {
           response.status(404).json({
@@ -118,8 +129,8 @@ export function registerWorkerRoutes(
           });
           return;
         }
-        const assignment = await scheduler.touch(id);
-        if (!assignment) {
+        const assignments = await scheduler.touch(id, body.purpose);
+        if (!assignments.length) {
           response.status(404).json({
             error: {
               code: "assignment_not_found",
@@ -129,7 +140,7 @@ export function registerWorkerRoutes(
           });
           return;
         }
-        if (assignment.status !== "active") {
+        if (assignments.some((assignment) => assignment.status !== "active")) {
           response.status(409).json({
             error: {
               code: "assignment_not_active",
@@ -140,10 +151,16 @@ export function registerWorkerRoutes(
           return;
         }
         response.setHeader("cache-control", "no-store");
+        const leaseExpiresAt = new Date(Math.min(...assignments.map((assignment) => assignment.leaseExpiresAt.getTime())));
         response.json({
           data: {
-            status: assignment.status,
-            lease_expires_at: assignment.leaseExpiresAt.toISOString(),
+            status: "active",
+            lease_expires_at: leaseExpiresAt.toISOString(),
+            assignments: assignments.map((assignment) => ({
+              purpose: assignment.purpose,
+              status: assignment.status,
+              lease_expires_at: assignment.leaseExpiresAt.toISOString(),
+            })),
           },
         });
       } catch (error) { next(error); }

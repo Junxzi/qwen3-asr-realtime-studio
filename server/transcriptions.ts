@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
+import type { ProcessingMode } from "./processing-modes.js";
 
 export type TranscriptSource = "microphone" | "file";
 export type TranscriptionStatus = "recording" | "completed" | "interrupted" | "failed";
@@ -28,7 +29,9 @@ export interface TranscriptionSession {
   title_customized: boolean;
   status: TranscriptionStatus;
   source: TranscriptSource;
+  processing_mode: ProcessingMode;
   model_id: string;
+  final_model_id: string | null;
   catalog_revision: string;
   started_at: string;
   ended_at: string | null;
@@ -51,6 +54,7 @@ export interface TranscriptUtterance {
   text: string;
   words: StoredWord[];
   context_hits: string[];
+  audio_start_ms: number;
   audio_end_ms: number;
   latency_ms: number | null;
   queue_ms: number | null;
@@ -72,7 +76,9 @@ export interface ListResult {
 export interface CreateTranscriptionInput {
   id: string;
   source: TranscriptSource;
+  processingMode: ProcessingMode;
   modelId: string;
+  finalModelId: string | null;
   catalogRevision: string;
   now: Date;
   retentionDays: number;
@@ -84,6 +90,7 @@ export interface UpsertUtteranceInput {
   text: string;
   words: StoredWord[];
   contextHits: string[];
+  audioStartMs?: number;
   audioEndMs: number;
   latencyMs: number | null;
   queueMs: number | null;
@@ -219,7 +226,9 @@ export class MemoryTranscriptionStore implements TranscriptionStore {
       title_customized: false,
       status: "recording",
       source: input.source,
+      processing_mode: input.processingMode,
       model_id: input.modelId,
+      final_model_id: input.finalModelId,
       catalog_revision: input.catalogRevision,
       started_at: timestamp,
       ended_at: null,
@@ -276,6 +285,7 @@ export class MemoryTranscriptionStore implements TranscriptionStore {
         text: input.text,
         words: input.words.map((word) => ({ ...word })),
         context_hits: [...input.contextHits],
+        audio_start_ms: input.audioStartMs ?? 0,
         audio_end_ms: input.audioEndMs,
         latency_ms: input.latencyMs,
         queue_ms: input.queueMs,
@@ -296,6 +306,7 @@ export class MemoryTranscriptionStore implements TranscriptionStore {
       text: input.text,
       words: input.words.map((word) => ({ ...word })),
       context_hits: [...input.contextHits],
+      audio_start_ms: input.audioStartMs ?? 0,
       audio_end_ms: input.audioEndMs,
       latency_ms: input.latencyMs,
       queue_ms: input.queueMs,
@@ -357,7 +368,11 @@ export class MemoryTranscriptionStore implements TranscriptionStore {
     const threshold = now.getTime() - staleMinutes * 60_000;
     let updated = 0;
     for (const session of this.sessions.values()) {
-      if (session.status === "recording" && Date.parse(session.last_activity_at) < threshold) {
+      if (
+        session.status === "recording"
+        && Date.parse(session.expires_at) > now.getTime()
+        && Date.parse(session.last_activity_at) < threshold
+      ) {
         session.status = "interrupted";
         session.ended_at = now.toISOString();
         session.updated_at = now.toISOString();
@@ -376,13 +391,21 @@ export async function runRetentionMaintenance(
   now = new Date(),
   beforeFinalize?: (sessionId: string) => Promise<unknown>,
 ) {
-  if (beforeFinalize) {
-    const candidates = await store.listMaintenanceCandidates(now, config.transcriptStaleMinutes);
-    await Promise.all(candidates.map((sessionId) => beforeFinalize(sessionId)));
-  }
-  const [expired, stale] = await Promise.all([
-    store.deleteExpired(now),
-    store.markStale(now, config.transcriptStaleMinutes),
-  ]);
+  const candidates = await store.listMaintenanceCandidates(now, config.transcriptStaleMinutes);
+  const stale = await store.markStale(now, config.transcriptStaleMinutes);
+  await Promise.all(candidates.map(async (sessionId) => {
+    const current = await store.get(sessionId, now);
+    if (current?.status === "recording") return;
+    if (!current) {
+      await store.complete(sessionId, {
+        status: "interrupted",
+        durationMs: null,
+        metrics: {},
+        now,
+      });
+    }
+    await beforeFinalize?.(sessionId);
+  }));
+  const expired = await store.deleteExpired(now);
   return { expired, stale };
 }

@@ -159,4 +159,65 @@ describe("configuration", () => {
       RUNPOD_TEMPLATE_ID: "template-context",
     })).toThrow("RUNPOD_NETWORK_VOLUME_ID");
   });
+
+  it("requires the shared model volume for every live batch template", () => {
+    const environment = {
+      NODE_ENV: "test",
+      RUNPOD_PROVIDER: "live",
+      RUNPOD_API_KEY: "runpod-api-key",
+      RUNPOD_WORKER_ADMIN_SECRET: "worker-admin-secret-at-least-32-characters",
+      RUNPOD_WORKERS_JSON: "[]",
+      RUNPOD_MODEL_TEMPLATES_JSON: JSON.stringify([{
+        model_id: "infodeliverailab/lab_asr_diarization_v1",
+        runtime: "batch",
+        template_id: "template-batch",
+        max_sessions: 1,
+      }]),
+    };
+
+    expect(() => loadConfig(environment)).toThrow("RUNPOD_NETWORK_VOLUME_ID");
+    expect(() => loadConfig({
+      ...environment,
+      RUNPOD_NETWORK_VOLUME_ID: "   ",
+    })).toThrow("RUNPOD_NETWORK_VOLUME_ID");
+    expect(loadConfig({
+      ...environment,
+      RUNPOD_NETWORK_VOLUME_ID: "shared-model-volume",
+    }).modelTemplates).toEqual([
+      expect.objectContaining({ runtime: "batch", templateId: "template-batch" }),
+    ]);
+  });
+
+  it("does not require a volume setting merely to use an existing static batch Pod", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      RUNPOD_PROVIDER: "live",
+      RUNPOD_API_KEY: "runpod-api-key",
+      RUNPOD_WORKER_ADMIN_SECRET: "worker-admin-secret-at-least-32-characters",
+      RUNPOD_WORKERS_JSON: JSON.stringify([{
+        id: "static-batch",
+        pod_id: "pod-static-batch",
+        name: "Existing batch Pod",
+        service_url: "https://pod-static-batch-8000.proxy.runpod.net",
+        model_id: "infodeliverailab/lab_asr_diarization_v1",
+        runtime: "batch",
+        max_sessions: 1,
+        enabled: true,
+      }]),
+    });
+
+    expect(config.runpodNetworkVolumeId).toBe("");
+    expect(config.workers).toEqual([
+      expect.objectContaining({ id: "static-batch", runtime: "batch" }),
+    ]);
+    expect(config.modelTemplates).toEqual([]);
+  });
+
+  it("keeps idle Pod auto-stop opt-in", () => {
+    expect(loadConfig({ NODE_ENV: "test" }).autoStopIdleWorkers).toBe(false);
+    expect(loadConfig({
+      NODE_ENV: "test",
+      RUNPOD_AUTO_STOP_IDLE: "true",
+    }).autoStopIdleWorkers).toBe(true);
+  });
 });

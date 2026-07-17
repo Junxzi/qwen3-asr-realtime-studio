@@ -20,7 +20,9 @@ export const transcriptionSessions = pgTable("transcription_sessions", {
   titleCustomized: boolean("title_customized").notNull().default(false),
   status: varchar("status", { length: 24 }).notNull(),
   source: varchar("source", { length: 20 }).notNull(),
+  processingMode: varchar("processing_mode", { length: 16 }).notNull().default("realtime"),
   modelId: varchar("model_id", { length: 240 }).notNull(),
+  finalModelId: varchar("final_model_id", { length: 240 }),
   catalogRevision: varchar("catalog_revision", { length: 240 }).notNull().default(""),
   startedAt: timestamp("started_at", { withTimezone: true }).notNull(),
   endedAt: timestamp("ended_at", { withTimezone: true }),
@@ -46,6 +48,7 @@ export const transcriptUtterances = pgTable("transcript_utterances", {
   text: text("text").notNull(),
   words: jsonb("words").$type<StoredWord[]>().notNull().default([]),
   contextHits: jsonb("context_hits").$type<string[]>().notNull().default([]),
+  audioStartMs: integer("audio_start_ms").notNull().default(0),
   audioEndMs: integer("audio_end_ms").notNull().default(0),
   latencyMs: doublePrecision("latency_ms"),
   queueMs: doublePrecision("queue_ms"),
@@ -79,7 +82,7 @@ export const inferenceWorkers = pgTable("inference_workers", {
   uniqueIndex("inference_workers_pod_id_unique_idx").on(table.podId).where(sql`${table.podId} <> ''`),
 ]);
 
-export const transcriptionAssignments = pgTable("transcription_assignments", {
+export const legacyTranscriptionAssignments = pgTable("transcription_assignments", {
   id: uuid("id").primaryKey(),
   sessionId: uuid("session_id").notNull().references(() => transcriptionSessions.id, { onDelete: "cascade" }),
   workerId: varchar("worker_id", { length: 160 }).references(() => inferenceWorkers.id, { onDelete: "set null" }),
@@ -97,3 +100,21 @@ export const transcriptionAssignments = pgTable("transcription_assignments", {
   index("transcription_assignments_worker_status_idx").on(table.workerId, table.status),
   index("transcription_assignments_lease_idx").on(table.leaseExpiresAt),
 ]);
+
+// This relation is a writable compatibility view created by the hand-authored
+// 0003 migration. Keep a table-shaped Drizzle mapping so INSERT/UPDATE/RETURNING
+// use the view triggers; do not let schema generation recreate it as a table.
+export const transcriptionAssignments = pgTable("transcription_assignment_purposes", {
+  id: uuid("id").primaryKey(),
+  sessionId: uuid("session_id").notNull(),
+  workerId: varchar("worker_id", { length: 160 }),
+  modelId: varchar("model_id", { length: 240 }).notNull(),
+  purpose: varchar("purpose", { length: 20 }).notNull(),
+  status: varchar("status", { length: 24 }).notNull(),
+  message: text("message"),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }).notNull(),
+  activatedAt: timestamp("activated_at", { withTimezone: true }),
+  releasedAt: timestamp("released_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
+});

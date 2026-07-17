@@ -1,4 +1,4 @@
-import type { AppConfig } from "./config.js";
+import { modelTemplateRequiresNetworkVolume, type AppConfig } from "./config.js";
 import { DEFAULT_ASR_MODEL_ID } from "./asr-models.js";
 import { ProviderError } from "./runpod.js";
 import type { PodInfo, PodProvider, ServiceProbe, WorkerRecord } from "./types.js";
@@ -261,6 +261,13 @@ export class LiveRunPodFleetClient implements RunPodFleetClient {
       candidate.modelId === input.modelId && candidate.runtime === input.runtime
     ));
     if (!profile) throw new ProviderError("runpod_template_missing", "このモデル用のRunPod Templateが設定されていません", 503);
+    if (modelTemplateRequiresNetworkVolume(profile) && !this.config.runpodNetworkVolumeId) {
+      throw new ProviderError(
+        "runpod_network_volume_required",
+        "RUNPOD_NETWORK_VOLUME_ID is required before this worker template can be provisioned",
+        503,
+      );
+    }
     const env: Record<string, string> = {
       WORKER_ID: input.workerId,
       MODEL_ID: input.modelId,

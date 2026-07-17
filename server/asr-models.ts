@@ -18,6 +18,7 @@ export interface AsrModelDescriptor {
 }
 
 export const DEFAULT_ASR_MODEL_ID = "infodeliverailab/qwen3-asr-ja-rlbr-context-fullft";
+export const FINALIZER_ASR_MODEL_ID = "infodeliverailab/lab_asr_diarization_v1";
 
 const ASR_MODELS: readonly AsrModelDescriptor[] = [
   {
@@ -51,7 +52,7 @@ const ASR_MODELS: readonly AsrModelDescriptor[] = [
     selectable: false,
   },
   {
-    id: "infodeliverailab/lab_asr_diarization_v1",
+    id: FINALIZER_ASR_MODEL_ID,
     display_name: "Lab ASR Diarization v1",
     short_name: "Diarization v1",
     description: "ECAPA話者特徴をtemporal interleaveするオフライン比較モデル",
@@ -62,8 +63,8 @@ const ASR_MODELS: readonly AsrModelDescriptor[] = [
     recommended: false,
     estimated_vram_gb: 32,
     source: "private_model",
-    integration_status: "adapter_required",
-    selectable: false,
+    integration_status: "gpu_validation_required",
+    selectable: true,
   },
   {
     id: "infodeliverailab/lab_asr_diarization_v2",
@@ -99,6 +100,10 @@ const ASR_MODELS: readonly AsrModelDescriptor[] = [
 
 export function listAsrModels() {
   return ASR_MODELS.map((model) => ({ ...model, input_modes: [...model.input_modes] }));
+}
+
+export function findAsrModel(modelId: string) {
+  return ASR_MODELS.find((model) => model.id === modelId);
 }
 
 export function isSupportedAsrModel(modelId: string) {
