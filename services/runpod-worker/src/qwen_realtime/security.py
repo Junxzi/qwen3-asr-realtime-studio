@@ -6,10 +6,11 @@ import hashlib
 import hmac
 import json
 import time
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
+WorkerTicketPurpose = Literal["realtime", "batch"]
 WORKER_TICKET_AUDIENCE = "qwen-realtime-worker"
-WORKER_TICKET_PURPOSE = "realtime"
+WORKER_TICKET_PURPOSE: WorkerTicketPurpose = "realtime"
 
 
 class WorkerTicketError(ValueError):
@@ -39,6 +40,7 @@ def create_worker_ticket(
     session_id: str,
     model_id: str,
     expires_at: int,
+    purpose: WorkerTicketPurpose = WORKER_TICKET_PURPOSE,
     audience: str = WORKER_TICKET_AUDIENCE,
 ) -> str:
     """Create the documented payload.signature ticket used by the control plane."""
@@ -48,7 +50,7 @@ def create_worker_ticket(
         "aud": audience,
         "exp": expires_at,
         "mid": model_id,
-        "purpose": WORKER_TICKET_PURPOSE,
+        "purpose": purpose,
         "sid": session_id,
         "wid": worker_id,
     }
@@ -74,9 +76,38 @@ def verify_worker_ticket(
     worker_id: str,
     session_id: str,
     model_id: str,
+    purpose: WorkerTicketPurpose = WORKER_TICKET_PURPOSE,
     now: int | None = None,
     audience: str = WORKER_TICKET_AUDIENCE,
 ) -> Mapping[str, Any]:
+    claims = verify_worker_ticket_envelope(
+        ticket,
+        secret=secret,
+        worker_id=worker_id,
+        purpose=purpose,
+        now=now,
+        audience=audience,
+    )
+    expected = {
+        "mid": model_id,
+        "sid": session_id,
+    }
+    if any(claims.get(key) != value for key, value in expected.items()):
+        raise WorkerTicketError("ticket claims do not match this connection")
+    return claims
+
+
+def verify_worker_ticket_envelope(
+    ticket: str,
+    *,
+    secret: str,
+    worker_id: str,
+    purpose: WorkerTicketPurpose = WORKER_TICKET_PURPOSE,
+    now: int | None = None,
+    audience: str = WORKER_TICKET_AUDIENCE,
+) -> Mapping[str, Any]:
+    """Authenticate signed routing claims before reading a request body."""
+
     parts = ticket.split(".")
     if len(parts) != 2:
         raise WorkerTicketError("ticket format is invalid")
@@ -98,9 +129,7 @@ def verify_worker_ticket(
     expected = {
         "v": 1,
         "aud": audience,
-        "mid": model_id,
-        "purpose": WORKER_TICKET_PURPOSE,
-        "sid": session_id,
+        "purpose": purpose,
         "wid": worker_id,
     }
     if any(claims.get(key) != value for key, value in expected.items()):

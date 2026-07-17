@@ -109,10 +109,15 @@ async def test_session_emits_partial_then_contextual_final():
         if event is None:
             break
         events.append(event)
-    assert [event.type for event in events] == ["transcript.partial", "transcript.final"]
-    assert events[0].speaker_hint == "speaker_0"
-    assert events[-1].context_hits == ["nomura"]
-    assert events[-1].words[0].speaker == "speaker_0"
+    transcripts = [event for event in events if event.type.startswith("transcript.")]
+    assert [event.type for event in transcripts] == ["transcript.partial", "transcript.final"]
+    assert transcripts[0].speaker_hint == "speaker_0"
+    assert transcripts[-1].context_hits == ["nomura"]
+    assert transcripts[-1].words[0].speaker == "speaker_0"
+    stages = [event for event in events if event.type == "pipeline.stage"]
+    assert all(event.utterance_id for event in stages)
+    assert any(event.stage == "context_asr" and event.status == "running" for event in stages)
+    assert not any(event.stage == "replace_result" for event in stages)
     assert backend.calls[0][0].context == ""
     assert "<write>野村證券</write>" in backend.calls[-1][0].context
 
@@ -194,9 +199,16 @@ async def test_final_diarization_timeout_uses_cached_activities():
             break
         events.append(event)
     assert elapsed < 0.5
-    assert [event.type for event in events] == ["transcript.final"]
-    assert events[0].text == "野村"
-    assert all(word.speaker == "speaker_1" for word in events[0].words)
+    finals = [event for event in events if event.type == "transcript.final"]
+    assert len(finals) == 1
+    assert finals[0].text == "野村"
+    assert all(word.speaker == "speaker_1" for word in finals[0].words)
+    assert any(
+        event.type == "pipeline.stage"
+        and event.stage == "streaming_sortformer"
+        and event.status == "fallback"
+        for event in events
+    )
 
 
 async def test_diarization_cleanup_has_its_own_short_timeout():
@@ -239,7 +251,11 @@ async def test_diarization_cleanup_has_its_own_short_timeout():
     await scheduler.close()
 
     assert elapsed < 0.5
-    assert (await session.events.get()).type == "transcript.final"
+    while True:
+        event = await session.events.get()
+        assert event is not None
+        if event.type == "transcript.final":
+            break
 
 
 async def test_diarization_submits_each_audio_sample_once_and_flushes_state():
@@ -268,6 +284,7 @@ async def test_diarization_submits_each_audio_sample_once_and_flushes_state():
     settings = Settings(
         chunk_seconds=10.0,
         diarizer_interval_ms=500,
+        max_session_events=128,
         catalog_path=None,  # type: ignore[arg-type]
     )
     scheduler = BatchingScheduler(FakeASRBackend(script=["野村"]), batch_size=8, window_ms=1)
@@ -279,17 +296,32 @@ async def test_diarization_submits_each_audio_sample_once_and_flushes_state():
         ContextRetriever(Catalog.empty()),
         diarizer,
     )
-    for _ in range(12):
-        await session.feed(pcm(3000))
-    for _ in range(5):
-        await session.feed(pcm(0))
+    for _ in range(2):
+        for _ in range(6):
+            await session.feed(pcm(3000))
+        for _ in range(5):
+            await session.feed(pcm(0))
     await session.finish()
     await scheduler.close()
 
-    assert len(diarizer.calls) == 2
-    first, final = diarizer.calls
+    assert len(diarizer.calls) >= 2
+    first, *_, final = diarizer.calls
     assert first[1] == 0
-    assert final[1] == first[1] + first[2]
+    for previous, current in zip(diarizer.calls, diarizer.calls[1:], strict=False):
+        assert current[1] == previous[1] + previous[2]
     assert final[3] is True
-    assert sum(call[2] for call in diarizer.calls) == final[1] + final[2]
-    assert diarizer.closed == [first[0]]
+    assert all(call[2] < 2 * settings.sample_rate for call in diarizer.calls)
+    assert sum(call[2] for call in diarizer.calls) == 22 * 1_600
+    assert {call[0] for call in diarizer.calls} == {"incremental"}
+    assert diarizer.closed == ["incremental"]
+
+    finals = []
+    while True:
+        event = await session.events.get()
+        if event is None:
+            break
+        if event.type == "transcript.final":
+            finals.append(event)
+    assert len(finals) == 2
+    assert finals[0].audio_start_ms == 0
+    assert finals[1].audio_start_ms >= finals[0].audio_end_ms

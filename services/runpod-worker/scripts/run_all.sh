@@ -54,6 +54,15 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 
+if [[ "${WORKER_RUNTIME:-realtime}" == "batch" ]]; then
+  "$ASR_PYTHON" "$APP_ROOT/scripts/bootstrap_lab_batch.py"
+  kill "$BOOTSTRAP_PID" 2>/dev/null || true
+  wait "$BOOTSTRAP_PID" 2>/dev/null || true
+  BOOTSTRAP_PID=""
+  trap - EXIT INT TERM
+  exec "$APP_ROOT/scripts/run_lab_batch.sh"
+fi
+
 if [[ "${ASR_BACKEND:-qwen_async_vllm}" != "fake" && "${BOOTSTRAP_MODELS:-true}" == "true" ]]; then
   "$ASR_PYTHON" "$APP_ROOT/scripts/bootstrap_models.py"
 fi

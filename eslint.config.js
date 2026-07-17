@@ -13,6 +13,7 @@ export default tseslint.config(
       "outputs",
       "work",
       "**/.venv/**",
+      "**/.pytest_cache/**",
     ],
   },
   js.configs.recommended,

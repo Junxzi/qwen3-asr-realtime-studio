@@ -15,12 +15,14 @@ dependencies = [
   "numpy>=1.26,<3",
   "prometheus-client>=0.21,<1",
   "pydantic>=2.8,<3",
+  "python-multipart>=0.0.18,<1",
   "uvicorn[standard]>=0.34,<1",
 ]
 
 [project.optional-dependencies]
 gpu = [
   "qwen-asr==0.0.6",
+  "speechbrain==1.1.0",
   "vllm[audio]==0.14.0",
   "silero-vad==6.2.1",
 ]
@@ -35,6 +37,7 @@ dev = [
 
 [project.scripts]
 qwen-realtime = "qwen_realtime.app:main"
+qwen-lab-batch = "qwen_realtime.lab_batch:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/qwen_realtime"]

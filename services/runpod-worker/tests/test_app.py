@@ -104,6 +104,14 @@ def test_websocket_contract_and_health(tmp_path):
                 "worker_id": WORKER_ID,
                 "model_id": MODEL_ID,
                 "input_end_supported": True,
+                "pipeline_id": "context_realtime_v1",
+                "capabilities": {
+                    "pipeline_events": True,
+                    "input_end": True,
+                    "partial_transcripts": True,
+                    "speaker_hints": True,
+                    "final_word_timestamps": False,
+                },
             }
             voice = np.full(1600, 3000, dtype="<i2").tobytes()
             silence = np.zeros(1600, dtype="<i2").tobytes()
@@ -111,7 +119,11 @@ def test_websocket_contract_and_health(tmp_path):
                 socket.send_bytes(voice)
             for _ in range(5):
                 socket.send_bytes(silence)
-            messages = [socket.receive_json(), socket.receive_json()]
+            messages = []
+            while not messages or messages[-1]["type"] != "transcript.final":
+                message = socket.receive_json()
+                if message["type"].startswith("transcript."):
+                    messages.append(message)
             assert [message["type"] for message in messages] == [
                 "transcript.partial",
                 "transcript.final",
@@ -120,6 +132,9 @@ def test_websocket_contract_and_health(tmp_path):
                 assert message["latency_ms"] >= 0
                 assert message["queue_ms"] >= 0
                 assert message["rtf"] >= 0
+            assert messages[-1]["authoritative"] is True
+            assert messages[-1]["audio_start_ms"] == 0
+            assert messages[-1]["audio_end_ms"] >= 1_400
 
 
 def test_input_end_flushes_tail_before_finalized_ack(tmp_path):
@@ -137,8 +152,12 @@ def test_input_end_flushes_tail_before_finalized_ack(tmp_path):
             socket.send_text(json.dumps({"type": "input.end"}))
 
             tail = socket.receive_json()
+            while tail["type"] == "pipeline.stage":
+                tail = socket.receive_json()
             assert tail["type"] == "transcript.final"
             finalized = socket.receive_json()
+            while finalized["type"] == "pipeline.stage":
+                finalized = socket.receive_json()
             assert finalized == {
                 "type": "stream.finalized",
                 "session_id": "explicit-end",
@@ -201,7 +220,10 @@ def test_cumulative_audio_limit_is_checked_before_buffering(tmp_path):
             voice = np.full(1_600, 3_000, dtype="<i2").tobytes()
             socket.send_bytes(voice)
             socket.send_bytes(voice)
-            assert socket.receive_json()["code"] == "stream_audio_limit_exceeded"
+            message = socket.receive_json()
+            while message["type"] == "pipeline.stage":
+                message = socket.receive_json()
+            assert message["code"] == "stream_audio_limit_exceeded"
             with pytest.raises(WebSocketDisconnect) as closed:
                 socket.receive_json()
             assert closed.value.code == 1008
@@ -346,6 +368,26 @@ def test_readiness_rejects_wrong_model_and_missing_security(tmp_path):
     with TestClient(insecure) as client:
         assert client.get("/health").status_code == 200
         assert client.get("/ready", params={"model_id": MODEL_ID}).status_code == 503
+        with client.websocket_connect("/v1/realtime") as socket:
+            socket.send_text(json.dumps(session_start("insecure-worker")))
+            assert socket.receive_json()["code"] == "worker_auth_misconfigured"
+
+
+def test_real_backend_cannot_disable_ticket_authentication(tmp_path):
+    settings = worker_settings(tmp_path)
+    runtime = build_runtime(settings)
+    runtime.settings = replace(
+        settings,
+        asr_backend="qwen_async_vllm",
+        require_worker_ticket=False,
+    )
+    app = create_app(runtime=runtime)
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/realtime") as socket:
+            start = session_start("real-auth")
+            start["connection_ticket"] = None
+            socket.send_text(json.dumps(start))
+            assert socket.receive_json()["code"] == "connection_ticket_required"
 
 
 def test_required_empty_catalog_blocks_readiness_and_websocket(tmp_path):
