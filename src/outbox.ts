@@ -1,8 +1,10 @@
+import { ApiError } from "./api";
 import type { PersistUtteranceInput } from "./types";
 
 const DATABASE_NAME = "infodeliver-asr-studio";
 const STORE_NAME = "transcription-outbox";
 const VERSION = 1;
+export const OUTBOX_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface OutboxItem {
   key: string;
@@ -10,6 +12,15 @@ export interface OutboxItem {
   utteranceId: string;
   payload: PersistUtteranceInput;
   createdAt: string;
+}
+
+export function outboxItemExpired(item: OutboxItem, now = Date.now()) {
+  const createdAt = Date.parse(item.createdAt);
+  return !Number.isFinite(createdAt) || createdAt <= now - OUTBOX_RETENTION_MS;
+}
+
+export function terminalOutboxFailure(error: unknown) {
+  return error instanceof ApiError && (error.status === 404 || error.status === 410);
 }
 
 function supportsIndexedDb() {
@@ -60,7 +71,11 @@ export async function enqueueOutbox(sessionId: string, utteranceId: string, payl
 
 export async function listOutbox(): Promise<OutboxItem[]> {
   const result = await withStore("readonly", (store) => store.getAll());
-  return (result || []) as OutboxItem[];
+  const items = (result || []) as OutboxItem[];
+  const expired = items.filter((item) => outboxItemExpired(item));
+  await Promise.all(expired.map((item) => removeOutbox(item.key)));
+  const expiredKeys = new Set(expired.map((item) => item.key));
+  return items.filter((item) => !expiredKeys.has(item.key));
 }
 
 export async function removeOutbox(key: string) {
@@ -75,14 +90,19 @@ export async function removeSessionOutbox(sessionId: string) {
 export async function flushOutbox(save: (item: OutboxItem) => Promise<unknown>) {
   const items = await listOutbox();
   let saved = 0;
+  let discarded = 0;
   for (const item of items) {
     try {
       await save(item);
       await removeOutbox(item.key);
       saved += 1;
-    } catch {
-      // Keep the remaining item for the next online/authenticated retry.
+    } catch (error) {
+      if (terminalOutboxFailure(error)) {
+        await removeOutbox(item.key);
+        discarded += 1;
+      }
+      // Retry transient network/auth/server failures on the next online tick.
     }
   }
-  return { pending: Math.max(0, items.length - saved), saved };
+  return { pending: Math.max(0, items.length - saved - discarded), saved, discarded };
 }

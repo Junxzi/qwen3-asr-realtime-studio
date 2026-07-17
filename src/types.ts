@@ -27,17 +27,58 @@ export interface ControlStatus {
     desiredStatus: "RUNNING" | "EXITED" | "TERMINATED";
     costPerHr?: string | number;
     gpu?: { id?: string; displayName?: string; count?: number } | null;
-  };
+  } | null;
   service: {
-    url: string;
-    websocketUrl: string;
-    batchUrl: string;
+    url?: string;
+    websocketUrl?: string;
+    batchUrl?: string;
     ready: boolean;
     health?: HealthInfo;
     message?: string;
   };
   operation?: { id: string; kind: "start" | "stop"; requestedAt: string } | null;
+  pool?: {
+    total_workers: number;
+    ready_workers: number;
+    active_sessions: number;
+    capacity: number;
+    provisioning_assignments: number;
+  };
   checkedAt: string;
+}
+
+export type AssignmentPurpose = "realtime" | "batch";
+export type AssignmentStatus = "requested" | "provisioning" | "ready" | "active" | "released" | "failed";
+
+export interface AssignedWorker {
+  id: string;
+  pod_id: string;
+  name?: string;
+  status?: string;
+  loaded_model_id?: string;
+  gpu_type?: string | null;
+  gpu?: { id?: string; displayName?: string; count?: number } | null;
+  health?: HealthInfo | null;
+}
+
+export interface AssignmentConnection {
+  websocket_url?: string;
+  batch_url?: string;
+  ticket: string;
+  expires_at: string;
+  catalog_revision?: string | null;
+}
+
+export interface InferenceAssignment {
+  id: string;
+  session_id: string;
+  model_id: string;
+  purpose: AssignmentPurpose;
+  status: AssignmentStatus;
+  worker?: AssignedWorker;
+  connection?: AssignmentConnection;
+  message?: string | null;
+  retry_after_ms?: number | null;
 }
 
 export type AsrRuntime = "realtime" | "batch";
@@ -55,6 +96,8 @@ export interface AsrModel {
   recommended: boolean;
   estimated_vram_gb: number;
   source: "private_model" | "public_recipe";
+  integration_status: "ready" | "gpu_validation_required" | "adapter_required";
+  selectable: boolean;
 }
 
 export interface AsrModelCatalog {

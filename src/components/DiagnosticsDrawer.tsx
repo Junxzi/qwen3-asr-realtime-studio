@@ -1,13 +1,16 @@
 import { RefreshCw } from "lucide-react";
+import { assignmentMessage } from "@/assignment";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { formatClock } from "@/lib/format";
-import type { AsrModel, ControlStatus, TranscriptionMetrics } from "@/types";
+import type { AsrModel, ControlStatus, InferenceAssignment, TranscriptionMetrics } from "@/types";
 
 interface DiagnosticsDrawerProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  status: ControlStatus;
+  status?: ControlStatus;
+  statusError?: string;
+  assignment?: InferenceAssignment | null;
   connection: "disconnected" | "connecting" | "connected" | "error";
   elapsedMs: number;
   metrics: TranscriptionMetrics;
@@ -38,6 +41,8 @@ export function DiagnosticsDrawer({
   open,
   onOpenChange,
   status,
+  statusError,
+  assignment,
   connection,
   elapsedMs,
   metrics,
@@ -46,11 +51,16 @@ export function DiagnosticsDrawer({
   model,
   onRefresh,
 }: DiagnosticsDrawerProps) {
-  const connected = connection === "connected" || status.service.ready;
-  const gpu = status.pod.gpu;
-  const health = status.service.health;
-  const gpuName = health?.accelerator || gpu?.displayName || gpu?.id || "—";
-  const gpuRunning = status.pod.desiredStatus === "RUNNING";
+  const connected = connection === "connected";
+  const gpu = status?.pod?.gpu;
+  const assignedWorker = assignment?.worker;
+  const health = assignedWorker?.health || status?.service.health;
+  const assignedGpu = assignedWorker?.gpu;
+  const gpuName = assignedWorker?.gpu_type || health?.accelerator || gpu?.displayName || gpu?.id || "—";
+  const workerRunning = ["ready", "busy", "running"].includes(assignedWorker?.status?.toLowerCase() || "");
+  const gpuRunning = assignedWorker ? workerRunning : status?.pod?.desiredStatus === "RUNNING";
+  const telemetryMatchesWorker = Boolean(assignedWorker?.health) || !assignedWorker || assignedWorker.pod_id === status?.pod?.id;
+  const pool = status?.pool;
   return (
     <Sheet open={open} onOpenChange={onOpenChange} modal={false}>
       <SheetContent
@@ -75,29 +85,47 @@ export function DiagnosticsDrawer({
           <dl>
             <div><dt>WebSocket</dt><dd className={connected ? "metric-success" : ""}><i />{connected ? "接続中" : "未接続"}</dd></div>
             <div><dt>接続時間</dt><dd>{formatClock(elapsedMs)}</dd></div>
-            <div><dt>RunPod</dt><dd>{status.pod.desiredStatus}</dd></div>
+            <div><dt>割り当て</dt><dd>{assignment ? assignmentMessage(assignment, model?.display_name) : "未割り当て"}</dd></div>
             <div><dt>保存待ち</dt><dd>{pendingSaves}件</dd></div>
           </dl>
         </section>
 
         <section className="diagnostic-section">
-          <h2>GPU <span>(Accelerator)</span></h2>
+          <h2>割り当てWorker <span>(Assigned worker)</span></h2>
           <dl>
             <div>
               <dt>状態</dt>
               <dd className={gpuRunning ? "metric-success" : ""}>
-                <i />{status.pod.desiredStatus}
+                <i />{assignedWorker?.status || assignment?.status || "未割り当て"}
               </dd>
             </div>
+            <div><dt>Worker ID</dt><dd title={assignedWorker?.id}>{assignedWorker?.id || "—"}</dd></div>
+            <div><dt>RunPod ID</dt><dd title={assignedWorker?.pod_id}>{assignedWorker?.pod_id || "—"}</dd></div>
+            <div><dt>Worker名</dt><dd title={assignedWorker?.name}>{assignedWorker?.name || "—"}</dd></div>
             <div><dt>GPU構成</dt><dd title={gpuName}>{gpuName}</dd></div>
-            <div><dt>台数</dt><dd>{gpu?.count ? `${gpu.count}基` : "—"}</dd></div>
-            <div><dt>ASR readiness</dt><dd className={status.service.ready ? "metric-success" : ""}>{status.service.ready ? "Ready" : "停止中"}</dd></div>
-            <div><dt>使用率</dt><dd>{metric(health?.gpu_utilization_percent, "%")}</dd></div>
-            <div><dt>VRAM</dt><dd>{gpuMemory(health?.gpu_memory_used_mb, health?.gpu_memory_total_mb)}</dd></div>
-            <div><dt>温度</dt><dd>{metric(health?.gpu_temperature_c, "°C")}</dd></div>
-            <div><dt>消費電力</dt><dd>{metric(health?.gpu_power_w, "W")}</dd></div>
-            <div><dt>時間単価</dt><dd>{hourlyCost(status.pod.costPerHr)}</dd></div>
+            <div><dt>台数</dt><dd>{typeof assignedGpu?.count === "number" ? `${assignedGpu.count}基` : telemetryMatchesWorker && gpu?.count ? `${gpu.count}基` : "—"}</dd></div>
+            <div><dt>要求モデル</dt><dd title={assignment?.model_id}>{assignment?.model_id || model?.id || "—"}</dd></div>
+            <div><dt>読込モデル</dt><dd title={assignedWorker?.loaded_model_id}>{assignedWorker?.loaded_model_id || "—"}</dd></div>
+            <div><dt>使用率</dt><dd>{telemetryMatchesWorker ? metric(health?.gpu_utilization_percent, "%") : "—"}</dd></div>
+            <div><dt>VRAM</dt><dd>{telemetryMatchesWorker ? gpuMemory(health?.gpu_memory_used_mb, health?.gpu_memory_total_mb) : "—"}</dd></div>
+            <div><dt>温度</dt><dd>{telemetryMatchesWorker ? metric(health?.gpu_temperature_c, "°C") : "—"}</dd></div>
+            <div><dt>消費電力</dt><dd>{telemetryMatchesWorker ? metric(health?.gpu_power_w, "W") : "—"}</dd></div>
+            <div><dt>時間単価</dt><dd>{telemetryMatchesWorker ? hourlyCost(status?.pod?.costPerHr) : "—"}</dd></div>
           </dl>
+        </section>
+
+        <section className="diagnostic-section">
+          <h2>GPUプール <span>(Worker pool)</span></h2>
+          {pool ? (
+            <dl>
+              <div><dt>Worker</dt><dd>{pool.ready_workers} ready / {pool.total_workers} total</dd></div>
+              <div><dt>利用中セッション</dt><dd>{pool.active_sessions}</dd></div>
+              <div><dt>総容量</dt><dd>{pool.capacity}</dd></div>
+              <div><dt>準備中</dt><dd>{pool.provisioning_assignments}</dd></div>
+            </dl>
+          ) : (
+            <p>{statusError || (status ? "プール集計はまだ提供されていません。" : "プール状態を取得しています。")}</p>
+          )}
         </section>
 
         <section className="diagnostic-section">
@@ -114,15 +142,15 @@ export function DiagnosticsDrawer({
           <h2>コンテキスト <span>(Context)</span></h2>
           <dl>
             <div><dt>Context hits</dt><dd className="metric-success">{metric(metrics.context_hits)}</dd></div>
-            <div><dt>カタログ</dt><dd>{status.service.health?.catalog_terms ? `${status.service.health.catalog_terms}語` : "—"}</dd></div>
+            <div><dt>カタログ</dt><dd>{health?.catalog_terms ? `${health.catalog_terms}語` : "—"}</dd></div>
             <div>
               <dt>Catalog revision</dt>
-              <dd title={status.service.health?.catalog_revision}>
-                {status.service.health?.catalog_revision || "—"}
+              <dd title={health?.catalog_revision}>
+                {health?.catalog_revision || "—"}
               </dd>
             </div>
             <div><dt>選択モデル</dt><dd title={model?.id}>{model?.display_name || "—"}</dd></div>
-            <div><dt>稼働モデル</dt><dd title={status.service.health?.model}>{status.service.health?.model || "—"}</dd></div>
+            <div><dt>稼働モデル</dt><dd title={assignedWorker?.loaded_model_id}>{assignedWorker?.loaded_model_id || health?.model || "—"}</dd></div>
             <div><dt>実行方式</dt><dd>{model?.runtime === "batch" ? "ファイル一括" : model ? "リアルタイム" : "—"}</dd></div>
           </dl>
         </section>
